@@ -96,6 +96,11 @@ export class LLMClient {
         if (part.type === "error") throw classifyError(part.error);
         yield part;
       }
+
+      // AI SDK 在审批后的调用中会先执行工具，并把生成的 tool-result 放在
+      // responseMessages 中交给模型。流正常结束后将这些消息写回项目自己的历史，
+      // 确保后续轮次仍能看到工具结果；中断或异常时不写入不完整响应。
+      conv.addMessages(await result.responseMessages);
     } catch (err) {
       throw classifyError(err);
     }

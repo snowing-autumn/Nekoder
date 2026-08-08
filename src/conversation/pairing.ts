@@ -1,59 +1,120 @@
-import type { Message, ToolResultBlock } from "./conversation.js";
+import type {
+  ModelMessage,
+  ToolCallPart,
+  ToolResultPart,
+} from "ai";
 
-// Anthropic 要求每个 tool_use 都有配对的 tool_result，缺一个整条请求就会被拒。
-// 会话历史出现不配对的情况有几种来路：用户中断在工具执行途中、进程退出后从磁盘
-// 恢复会话、并发写入交错。这里在发请求前统一补齐，各前端不必各写一遍。
+// AI SDK 会校验历史中的每个 tool-call 是否有对应的 tool-result，但不会为传入的
+// 历史记录自动补齐结果。中断工具执行、从磁盘恢复会话等情况都可能留下悬空调用，
+// 因此在请求模型前统一修复，避免各个调用方重复处理。
 
-/** 用于补上没有结果的工具调用。工具可能压根没启动，也可能跑到一半被打断，
- *  所以措辞上不能断言它没有产生任何副作用。 */
+/**
+ * 用于补上没有结果的工具调用。
+ *
+ * 工具可能根本没有启动，也可能执行到一半后被中断，所以不能断言它没有产生副作用。
+ */
 export const INTERRUPTED_TOOL_RESULT =
   "Tool execution was interrupted. The tool may or may not have completed; verify before relying on its effects.";
 
-/** 用于用户明确拒绝授权的工具调用。这种情况可以断言什么都没改，必须讲清楚，
- *  否则模型会以为修改已经生效并继续往下走。 */
+/**
+ * 用于用户明确拒绝授权的工具调用。
+ */
 export const REJECTED_TOOL_RESULT =
   "The user rejected this tool use. Nothing was changed (for file edits, the new content was NOT written).";
 
 /**
- * 返回一份修好配对关系的消息副本，输入不会被修改。
+ * 返回一份修复好工具调用配对关系的消息副本，不修改输入。
  *
- * 做两件事：给没有结果的 tool_use 补一条标记为错误的 tool_result（紧跟其后），
- * 丢掉找不到对应 tool_use 的孤儿 tool_result。补出来的内容不写回对话历史：
- * 历史应当如实记录发生过什么，补位只是为了让这一次请求合法。
+ * - 给没有结果的本地 tool-call 补一条 error-text tool-result；
+ * - 丢弃没有对应、且位于调用之前的孤儿或重复 tool-result；
+ * - providerExecuted 调用由 provider 自己管理，不要求本地 tool-result；
+ * - 在下一条非 tool 消息之前补齐结果，以满足 AI SDK 的历史校验规则。
+ *
+ * 补出的结果只用于当前请求合法化，不应写回真实会话历史。
  */
-export function ensureToolPairing(messages: Message[]): Message[] {
-  const resolved = new Set<string>();
-  const issued = new Set<string>();
-  for (const m of messages) {
-    for (const tr of m.toolResults ?? []) resolved.add(tr.toolUseId);
-    for (const tu of m.toolUses ?? []) issued.add(tu.toolUseId);
-  }
+export function ensureToolPairing(messages: ModelMessage[]): ModelMessage[] {
+  const out: ModelMessage[] = [];
+  // pending 只表示“如果到边界仍未处理，就需要补中断结果”。审批响应可以解除
+  // pending，但不代表真实 tool-result 已经出现。
+  const pending = new Map<string, ToolCallPart>();
+  // 已出现过的本地调用，用于判断 tool-result 是合法结果还是孤儿结果。
+  const knownToolCalls = new Set<string>();
+  // 每个调用只保留一个结果；与 pending 分开，避免审批响应使合法结果被误删。
+  const resultSeen = new Set<string>();
+  const approvalToolCalls = new Map<string, string>();
 
-  const out: Message[] = [];
-  for (const m of messages) {
-    let current = m;
-    if ((m.toolResults?.length ?? 0) > 0) {
-      const kept = (m.toolResults ?? []).filter((tr) => issued.has(tr.toolUseId));
-      if (kept.length === 0 && !m.content && !(m.toolUses?.length ?? 0)) {
-        continue; // 整条消息只剩空壳，丢掉以免破坏角色交替
+  const appendMissingResults = (): void => {
+    if (pending.size === 0) return;
+
+    const content: ToolResultPart[] = Array.from(
+      pending.values(),
+      (toolCall): ToolResultPart => ({
+        type: "tool-result",
+        toolCallId: toolCall.toolCallId,
+        toolName: toolCall.toolName,
+        output: {
+          type: "error-text",
+          value: INTERRUPTED_TOOL_RESULT,
+        },
+      })
+    );
+
+    out.push({ role: "tool", content });
+    for (const toolCallId of pending.keys()) resultSeen.add(toolCallId);
+    pending.clear();
+  };
+
+  for (const message of messages) {
+    if (message.role !== "tool") {
+      // AI SDK 在遇到 user/system 消息时要求前面的调用已全部得到结果；同时将
+      // 结果紧邻调用放置，也兼容对消息顺序要求更严格的 provider。
+      appendMissingResults();
+    }
+
+    if (message.role === "assistant") {
+      out.push(message);
+      if (!Array.isArray(message.content)) continue;
+
+      for (const part of message.content) {
+        if (part.type === "tool-call" && !part.providerExecuted) {
+          knownToolCalls.add(part.toolCallId);
+          pending.set(part.toolCallId, part);
+        } else if (part.type === "tool-approval-request") {
+          approvalToolCalls.set(part.approvalId, part.toolCallId);
+        }
       }
-      current = { ...m, toolResults: kept };
+      continue;
     }
-    out.push(current);
 
-    const missing: ToolResultBlock[] = [];
-    for (const tu of m.toolUses ?? []) {
-      if (resolved.has(tu.toolUseId)) continue;
-      missing.push({
-        toolUseId: tu.toolUseId,
-        content: INTERRUPTED_TOOL_RESULT,
-        isError: true,
+    if (message.role === "tool") {
+      const content = message.content.filter((part) => {
+        // AI SDK 将审批响应也视为该调用已有后续处理，不再要求 tool-result。
+        if (part.type === "tool-approval-response") {
+          const toolCallId = approvalToolCalls.get(part.approvalId);
+          if (toolCallId !== undefined) pending.delete(toolCallId);
+          return true;
+        }
+        if (part.type !== "tool-result") return true;
+
+        // 结果是否合法取决于是否存在对应调用，而不是该调用是否仍在 pending。
+        // 审批响应会提前解除 pending，但随后由 SDK 产生的真实结果仍必须保留。
+        if (!knownToolCalls.has(part.toolCallId)) return false;
+        if (resultSeen.has(part.toolCallId)) return false;
+
+        resultSeen.add(part.toolCallId);
+        pending.delete(part.toolCallId);
+        return true;
       });
-      resolved.add(tu.toolUseId);
+
+      if (content.length > 0) {
+        out.push({ ...message, content });
+      }
+      continue;
     }
-    if (missing.length > 0) {
-      out.push({ role: "user", content: "", toolResults: missing });
-    }
+
+    out.push(message);
   }
+
+  appendMissingResults();
   return out;
 }

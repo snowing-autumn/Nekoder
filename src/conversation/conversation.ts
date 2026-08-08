@@ -2,6 +2,8 @@ import type {
   AssistantContent,
   LanguageModelUsage,
   ModelMessage,
+  ToolApprovalResponse,
+  ToolContent,
   ToolResultPart,
 } from "ai";
 
@@ -25,10 +27,26 @@ export class ConversationManager {
     this.history.push({ role: "assistant", content });
   }
 
-  // ToolResultPart 自带 toolName 和 output，不需要再回溯 assistant 轮次去补
+  // 追加一条完整的 tool 消息，可同时承载审批响应和工具结果。
+  addToolMessage(content: ToolContent): void {
+    if (content.length === 0) return;
+    this.history.push({ role: "tool", content });
+  }
+
+  // 用户的批准/拒绝决定需要显式写入历史，下一次 AI SDK 调用才能处理它。
+  addToolApprovalResponses(responses: ToolApprovalResponse[]): void {
+    this.addToolMessage(responses);
+  }
+
+  // ToolResultPart 自带 toolName 和 output，不需要再回溯 assistant 轮次去补。
   addToolResults(results: ToolResultPart[]): void {
-    if (results.length === 0) return;
-    this.history.push({ role: "tool", content: results });
+    this.addToolMessage(results);
+  }
+
+  // 保存 AI SDK 一次调用生成的 assistant/tool 消息。LLMClient 在流正常结束后
+  // 使用此方法写回 responseMessages，其中也包括审批后执行产生的 tool-result。
+  addMessages(messages: readonly ModelMessage[]): void {
+    this.history.push(...messages);
   }
 
   addSystemReminder(content: string): void {

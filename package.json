@@ -3,6 +3,10 @@
   "module": "index.ts",
   "type": "module",
   "private": true,
+  "scripts": {
+    "test": "bun test tests/unit/pairing.test.ts",
+    "test:integration": "bun test tests/integration/message-roundtrip.test.ts"
+  },
   "devDependencies": {
     "@types/bun": "latest",
     "@types/node": "^26.1.2"
