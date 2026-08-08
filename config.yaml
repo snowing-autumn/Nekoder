@@ -1,0 +1,15 @@
+providers:
+  - name: anthropic-official
+    protocol: anthropic                    # 支持 anthropic / openai / openai-compat 三种协议
+    base_url: https://your-api-provider.com/api/anthropic
+    api_key: "your-api-key-here"
+    model: claude-sonnet-4-6
+    reasoning: high                        # 推理力度 none/minimal/low/medium/high/xhigh，不写则不下发该参数
+    # thinking: true                       # reasoning 的布尔简写，等价于 reasoning: high
+
+mcp_servers:
+  - name: context7
+    command: npx
+    args: ["-y", "@upstash/context7-mcp"]
+
+enable_coordinator_mode: false   # 设为 true 后创建 Team 时 Lead 只能调度不能写代码

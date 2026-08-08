@@ -1,0 +1,21 @@
+{
+  "name": "nekoder",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^26.1.2"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^4",
+    "@ai-sdk/openai": "^4",
+    "@ai-sdk/openai-compatible": "^3",
+    "ai": "^7",
+    "js-yaml": "^5.2.3",
+    "tokenlens": "^1.3.1"
+  }
+}
