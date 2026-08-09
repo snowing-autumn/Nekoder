@@ -3,7 +3,11 @@ import { createHash } from "node:crypto";
 
 import type { ToolEvent, ToolEventSink, ToolEventType } from "./events.js";
 import type { ToolRegistry } from "./registry.js";
-import type { ToolResult } from "./types.js";
+import type { AuthorizationTarget, ToolResult } from "./types.js";
+import type {
+  ApprovalDecision,
+  AuthorizationDecision as StructuredAuthorizationDecision,
+} from "../security/types.js";
 
 export interface ToolCall {
   readonly toolCallId: string;
@@ -26,7 +30,11 @@ export interface ToolBatchContext {
   readonly visibleToolNames?: ReadonlySet<string>;
 }
 
-export type AuthorizationDecision = "allow" | "deny" | "require_approval";
+export type AuthorizationDecision =
+  | "allow"
+  | "deny"
+  | "require_approval"
+  | StructuredAuthorizationDecision;
 
 export interface ToolAuthorizationRequest {
   readonly toolBatchId: string;
@@ -36,6 +44,7 @@ export interface ToolAuthorizationRequest {
   readonly preparedInput: unknown;
   readonly workspace: string;
   readonly taskMode: "plan" | "execute";
+  readonly authorizationTarget?: AuthorizationTarget;
   readonly signal?: AbortSignal;
 }
 
@@ -44,12 +53,20 @@ export interface ToolAuthorizer {
 }
 
 export interface ApprovalHandler {
-  requestApproval(request: ToolAuthorizationRequest): Promise<boolean>;
+  requestApproval(
+    request: ToolAuthorizationRequest,
+    decision?: Extract<StructuredAuthorizationDecision, { readonly kind: "ask" }>
+  ): Promise<boolean | ApprovalDecision>;
+}
+
+export interface PersistentRuleWriter {
+  add(scope: "local" | "user", rule: import("../security/types.js").PermissionRule): Promise<void>;
 }
 
 export interface ToolRunnerOptions {
   readonly authorizer?: ToolAuthorizer;
   readonly approvalHandler?: ApprovalHandler;
+  readonly persistentRuleWriter?: PersistentRuleWriter;
   readonly eventSink?: ToolEventSink;
   readonly maxParallelReads?: number;
 }
@@ -66,6 +83,8 @@ export interface ToolBatchResult {
 }
 
 export class ToolRunner {
+  private readonly sessionApprovals = new Set<string>();
+
   private eventSequence = 0;
   private readonly ajv = new Ajv2020({
     allErrors: true,
@@ -88,6 +107,7 @@ export class ToolRunner {
     calls: readonly ToolCall[],
     context: ToolBatchContext
   ): Promise<ToolBatchResult> {
+    const sessionApprovalSnapshot = new Set(this.sessionApprovals);
     let emissionTail = Promise.resolve();
     const emit = (
       type: ToolEventType,
@@ -190,7 +210,12 @@ export class ToolRunner {
       };
     }
     type PreparedEntry =
-      | { call: ToolCall; tool: NonNullable<ReturnType<ToolRegistry["get"]>>; data: unknown }
+      | {
+          call: ToolCall;
+          tool: NonNullable<ReturnType<ToolRegistry["get"]>>;
+          data: unknown;
+          authorizationTarget?: AuthorizationTarget;
+        }
       | { call: ToolCall; error: ToolResult<never> };
     const prepared = new Array<PreparedEntry>(calls.length);
     let nextPreparation = 0;
@@ -259,11 +284,29 @@ export class ToolRunner {
           prepared[index] = { call, error: preparation };
           continue;
         }
+        let authorizationTarget: AuthorizationTarget | undefined;
+        if (tool.authorizationTarget) {
+          const target = await tool.authorizationTarget(preparation.data, {
+            workspace: context.workspace,
+            ...(context.signal === undefined ? {} : { signal: context.signal }),
+          });
+          if (!target.ok) {
+            await emit("validation_failed", call, { errorCode: target.error.code });
+            prepared[index] = { call, error: target };
+            continue;
+          }
+          authorizationTarget = target.data;
+        }
         await emit("validated", call, {
           submittedArgsHash: hashJson(call.input),
           preparedArgsHash: hashJson(preparation.data),
         });
-        prepared[index] = { call, tool, data: preparation.data };
+        prepared[index] = {
+          call,
+          tool,
+          data: preparation.data,
+          ...(authorizationTarget === undefined ? {} : { authorizationTarget }),
+        };
       }
     };
     await Promise.all(
@@ -273,7 +316,7 @@ export class ToolRunner {
     for (let index = 0; index < prepared.length; index++) {
       const entry = prepared[index]!;
       if ("error" in entry) continue;
-      const { call, tool, data } = entry;
+      const { call, tool, data, authorizationTarget } = entry;
       const authorizationRequest: ToolAuthorizationRequest = {
         toolBatchId: context.toolBatchId,
         toolCallId: call.toolCallId,
@@ -282,26 +325,88 @@ export class ToolRunner {
         preparedInput: data,
         workspace: context.workspace,
         taskMode: context.taskMode ?? "execute",
+        ...(authorizationTarget === undefined ? {} : { authorizationTarget }),
         ...(context.signal === undefined ? {} : { signal: context.signal }),
       };
       const decision = await this.options.authorizer?.authorize(authorizationRequest) ?? "allow";
-      if (decision === "deny") {
+      if (decision === "deny" || (typeof decision === "object" && decision.kind === "deny")) {
         await emit("authorization_denied", call, { errorCode: "permission_denied" });
-        prepared[index] = { call, error: failure("permission_denied", "Tool call was denied") };
+        prepared[index] = {
+          call,
+          error: failure(
+            "permission_denied",
+            typeof decision === "object" ? decision.reason : "Tool call was denied",
+            false,
+            {
+              authorizationTarget,
+              ...(typeof decision === "object"
+                ? { source: decision.source, ...(decision.ruleId ? { ruleId: decision.ruleId } : {}) }
+                : {}),
+            }
+          ),
+        };
         continue;
       }
-      if (decision === "require_approval") {
+      if (decision === "require_approval" || (typeof decision === "object" && decision.kind === "ask")) {
+        const sessionApprovalKey = approvalKey(authorizationRequest);
+        if (
+          typeof decision === "object"
+          && decision.kind === "ask"
+          && decision.allowedScopes.includes("session")
+          && sessionApprovalSnapshot.has(sessionApprovalKey)
+        ) {
+          await emit("authorized", call);
+          continue;
+        }
         await emit("authorization_required", call);
         if (!this.options.approvalHandler) {
           prepared[index] = { call, error: failure("approval_required", "Tool call requires user approval") };
           continue;
         }
         await context.onApproval?.({ type: "requested", request: authorizationRequest });
-        const approved = await this.options.approvalHandler.requestApproval(authorizationRequest);
+        const approval = await this.options.approvalHandler.requestApproval(
+          authorizationRequest,
+          typeof decision === "object" && decision.kind === "ask" ? decision : undefined
+        );
+        let approved = typeof approval === "boolean"
+          ? approval
+          : approval.kind === "allow_once"
+            ? typeof decision !== "object" || decision.kind !== "ask" || decision.allowedScopes.includes("once")
+            : approval.kind === "allow_session"
+              ? typeof decision === "object" && decision.kind === "ask" && decision.allowedScopes.includes("session")
+              : approval.kind === "create_rule"
+                ? typeof decision === "object"
+                  && decision.kind === "ask"
+                  && decision.allowedScopes.includes(
+                    approval.scope === "local" ? "persistent_local" : "persistent_user"
+                  )
+                : false;
+        if (approved && typeof approval !== "boolean" && approval.kind === "create_rule") {
+          if (!this.options.persistentRuleWriter) {
+            approved = false;
+          } else {
+            try {
+              await this.options.persistentRuleWriter.add(approval.scope, approval.rule);
+            } catch {
+              approved = false;
+            }
+          }
+        }
+        if (approved && typeof approval !== "boolean" && approval.kind === "allow_session") {
+          this.sessionApprovals.add(sessionApprovalKey);
+        }
         await context.onApproval?.({ type: "resolved", request: authorizationRequest, approved });
         if (!approved) {
           await emit("authorization_denied", call, { errorCode: "approval_denied" });
-          prepared[index] = { call, error: failure("approval_denied", "User denied tool approval") };
+          prepared[index] = {
+            call,
+            error: failure(
+              "approval_denied",
+              "User denied tool approval",
+              false,
+              { authorizationTarget }
+            ),
+          };
           continue;
         }
       }
@@ -462,11 +567,43 @@ export class ToolRunner {
   }
 }
 
+function approvalKey(request: ToolAuthorizationRequest): string {
+  return canonicalJson({
+    workspace: request.workspace,
+    taskMode: request.taskMode,
+    toolName: request.toolName,
+    preparedInput: request.preparedInput,
+    authorizationTarget: request.authorizationTarget,
+  });
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
 function failure(
   code: import("./types.js").ToolErrorCode,
-  message: string
+  message: string,
+  retryable = false,
+  details?: unknown
 ): ToolResult<never> {
-  return { ok: false, error: { code, message, retryable: false } };
+  return {
+    ok: false,
+    error: {
+      code,
+      message,
+      retryable,
+      ...(details === undefined ? {} : { details }),
+    },
+  };
 }
 
 function skipped(

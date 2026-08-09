@@ -10,6 +10,7 @@ import {
 } from "ink";
 
 import type { TaskMode } from "../agent/types.js";
+import type { ApprovalDecision } from "../security/types.js";
 import {
   applyComposerAction,
   createComposerBuffer,
@@ -135,7 +136,13 @@ function ComposerLine({ text, cursor }: { readonly text: string; readonly cursor
   );
 }
 
-function ApprovalCard({ session }: { readonly session: SessionSnapshot }) {
+function ApprovalCard({
+  session,
+  confirmingUser,
+}: {
+  readonly session: SessionSnapshot;
+  readonly confirmingUser: boolean;
+}) {
   const pending = session.pendingApproval;
   if (!pending) return null;
   const input = pending.request.preparedInput;
@@ -150,13 +157,32 @@ function ApprovalCard({ session }: { readonly session: SessionSnapshot }) {
       ? record.absolutePath
       : typeof record.cwd === "string" ? record.cwd : pending.request.workspace
   );
+  const target = pending.request.authorizationTarget;
+  const decision = pending.authorizationDecision;
+  const scopes = decision?.allowedScopes ?? ["once"];
   return (
     <Box flexDirection="column" borderStyle="round" paddingX={1}>
       <Text bold color={TUI_COLORS.approval}>Approval required</Text>
-      <Text>command: {command}</Text>
-      <Text>cwd: {cwd}</Text>
-      <Text color={TUI_COLORS.approval}>Nekoder cannot prove this command has no side effects.</Text>
-      <Text><Text bold>[Y]</Text> Allow once  <Text bold>[N]</Text> Deny</Text>
+      <Text>tool: {sanitizeTerminalText(pending.request.toolName)} · effect: {pending.request.effect}</Text>
+      {decision && <Text>reason: {sanitizeTerminalText(decision.reason)}</Text>}
+      {decision && <Text>source: {decision.source}</Text>}
+      {target && <Text>target: {sanitizeTerminalText(target.primary)}</Text>}
+      {target?.requestedPath && <Text>requested: {sanitizeTerminalText(target.requestedPath)}</Text>}
+      {target?.resolvedPath && <Text>resolved: {sanitizeTerminalText(target.resolvedPath)}</Text>}
+      <Text>input: {sanitizeTerminalText(JSON.stringify(input))}</Text>
+      {pending.request.toolName === "run_command" && <Text>command: {command}</Text>}
+      {pending.request.toolName === "run_command" && <Text>cwd: {cwd}</Text>}
+      {decision && <Text>scopes: {decision.allowedScopes.join(", ")}</Text>}
+      {pending.request.toolName === "run_command" && <Text color={TUI_COLORS.approval}>Nekoder cannot prove this command has no side effects.</Text>}
+      {confirmingUser && <Text color={TUI_COLORS.danger}>This rule applies across all Workspaces. Press U again to confirm.</Text>}
+      <Text>
+        {!confirmingUser && scopes.includes("once") && <><Text bold>[Y]</Text> Allow once  </>}
+        {!confirmingUser && scopes.includes("session") && <><Text bold>[S]</Text> Allow session  </>}
+        {!confirmingUser && scopes.includes("persistent_local") && <><Text bold>[L]</Text> Always allow locally  </>}
+        {scopes.includes("persistent_user") && <><Text bold>[U]</Text> {confirmingUser ? "Confirm user-wide" : "Always allow user-wide"}  </>}
+        {confirmingUser && <><Text bold>[B]</Text> Back  </>}
+        <Text bold>[N]</Text> Deny
+      </Text>
     </Box>
   );
 }
@@ -196,6 +222,8 @@ function NekoSidebar({
       {!screenReader && <Text color={TUI_COLORS.chrome}>{cat}</Text>}
       <Text dimColor>Mode</Text>
       <Text color={session.taskMode === "plan" ? TUI_COLORS.plan : TUI_COLORS.execute}>{session.taskMode === "plan" ? "PLAN" : "EXECUTE"}</Text>
+      <Text dimColor>Permission</Text>
+      <Text>{session.permissionMode.toUpperCase()}</Text>
       <Text dimColor>State</Text>
       <Text color={runStateColor(visual)}>{visual.toUpperCase()}</Text>
       <Text dimColor>Current tokens</Text>
@@ -234,8 +262,12 @@ function Shell({
     dispatch({ type: "composer", action });
   };
   const [session, setSession] = useState<SessionSnapshot>(() =>
-    controller?.getSnapshot() ?? { taskMode, runStatus: "idle" }
+    controller?.getSnapshot() ?? { taskMode, permissionMode: "default", runStatus: "idle" }
   );
+  const [userConfirmation, setUserConfirmation] = useState<string>();
+  useEffect(() => {
+    setUserConfirmation(undefined);
+  }, [session.pendingApproval?.requestId]);
   useEffect(() => {
     if (!controller) return;
     const unsubscribeSnapshot = controller.subscribe(setSession);
@@ -259,7 +291,8 @@ function Shell({
     }
     if (mouse?.type === "left_release") {
       if (session.pendingApproval && mouse.y >= rows - 4) {
-        controller?.resolveApproval(mouse.x < 20);
+        const decision = mouseApprovalDecision(session.pendingApproval, mouse.x);
+        if (decision) controller?.resolveApprovalDecision(decision);
       } else if (mouse.y >= 2 && mouse.y < rows - 2) {
         dispatch({ type: "activate_transcript", index: visibleStart + mouse.y - 2 });
       }
@@ -279,8 +312,23 @@ function Shell({
       return;
     }
     if (session.pendingApproval) {
-      if (input.toLowerCase() === "y") controller?.resolveApproval(true);
-      else if (input.toLowerCase() === "n") controller?.resolveApproval(false);
+      const keyInput = input.toLowerCase();
+      const scopes = session.pendingApproval.authorizationDecision?.allowedScopes ?? ["once"];
+      if (keyInput === "y" && scopes.includes("once")) {
+        controller?.resolveApprovalDecision({ kind: "allow_once" });
+      } else if (keyInput === "s" && scopes.includes("session")) {
+        controller?.resolveApprovalDecision({ kind: "allow_session" });
+      } else if (keyInput === "l" && scopes.includes("persistent_local")) {
+        controller?.resolveApprovalDecision(localPersistentDecision(session.pendingApproval));
+      } else if (keyInput === "u" && scopes.includes("persistent_user")) {
+        if (userConfirmation === session.pendingApproval.requestId) {
+          controller?.resolveApprovalDecision(userPersistentDecision(session.pendingApproval));
+        } else {
+          setUserConfirmation(session.pendingApproval.requestId);
+        }
+      } else if (keyInput === "b" && userConfirmation === session.pendingApproval.requestId) {
+        setUserConfirmation(undefined);
+      } else if (keyInput === "n") controller?.resolveApprovalDecision({ kind: "deny" });
       else if (key.escape) {
         dispatch({ type: "cancel_requested" });
         controller?.cancelActiveRun();
@@ -384,10 +432,14 @@ function Shell({
           ))}
         </Box>
         <Box flexDirection="column" flexShrink={0}>
-          <ApprovalCard session={session} />
+          <ApprovalCard
+            session={session}
+            confirmingUser={userConfirmation === session.pendingApproval?.requestId}
+          />
           {!session.pendingApproval && <ComposerLine text={state.composer.text} cursor={state.composer.cursor} />}
           <Text>
             <Text color={session.taskMode === "plan" ? TUI_COLORS.plan : TUI_COLORS.execute}>[{session.taskMode === "plan" ? "PLAN" : "EXECUTE"}]</Text>{" "}
+            <Text>[{session.permissionMode.toUpperCase()}]</Text>{" "}
             <Text color={runStateColor(session.pendingApproval ? "awaiting_approval" : state.runVisualState)}>
               {(session.pendingApproval ? "awaiting_approval" : state.runVisualState).toUpperCase()}
             </Text>
@@ -397,6 +449,68 @@ function Shell({
       {columns >= 120 && <NekoSidebar session={session} state={state} debug={debug} screenReader={screenReader} />}
     </Box>
   );
+}
+
+function localPersistentDecision(
+  pending: NonNullable<SessionSnapshot["pendingApproval"]>
+): ApprovalDecision {
+  const target = pending.request.authorizationTarget;
+  const match = pending.request.toolName === "run_command" && target?.cwd
+    ? { command: target.primary, cwd: target.cwd }
+    : target?.primary ?? JSON.stringify(pending.request.preparedInput);
+  return {
+    kind: "create_rule",
+    scope: "local",
+    rule: {
+      id: `approval-${pending.requestId}`,
+      tool: pending.request.toolName,
+      match,
+      decision: "allow",
+    },
+  };
+}
+
+function userPersistentDecision(
+  pending: NonNullable<SessionSnapshot["pendingApproval"]>
+): ApprovalDecision {
+  const local = localPersistentDecision(pending);
+  if (local.kind !== "create_rule") throw new Error("Persistent decision must create a rule");
+  return {
+    ...local,
+    scope: "user",
+    rule: {
+      ...local.rule,
+      match: pending.request.authorizationTarget?.primary
+        ?? JSON.stringify(pending.request.preparedInput),
+    },
+  };
+}
+
+function mouseApprovalDecision(
+  pending: NonNullable<SessionSnapshot["pendingApproval"]>,
+  column: number
+): ApprovalDecision | undefined {
+  const scopes = pending.authorizationDecision?.allowedScopes ?? ["once"];
+  let start = 2;
+  const option = (label: string, decision: ApprovalDecision): ApprovalDecision | undefined => {
+    const end = start + label.length;
+    const selected = column >= start && column < end ? decision : undefined;
+    start = end;
+    return selected;
+  };
+  if (scopes.includes("once")) {
+    const selected = option("[Y] Allow once  ", { kind: "allow_once" });
+    if (selected) return selected;
+  }
+  if (scopes.includes("session")) {
+    const selected = option("[S] Allow session  ", { kind: "allow_session" });
+    if (selected) return selected;
+  }
+  if (scopes.includes("persistent_local")) {
+    const selected = option("[L] Always allow locally  ", localPersistentDecision(pending));
+    if (selected) return selected;
+  }
+  return option("[N] Deny", { kind: "deny" });
 }
 
 export function startTui(options: StartTuiOptions): TuiApplication {

@@ -1,6 +1,10 @@
 import type { ConversationManager } from "../conversation/conversation.js";
 import type { JSONValue, ToolResultPart } from "ai";
 import type { ModelInvoker, ModelUsage } from "../model/types.js";
+import {
+  buildSupplementalSystemTexts,
+  type PromptEnvironment,
+} from "../prompt/assembler.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import type { ToolRunner } from "../tools/runner.js";
 import { AsyncQueue } from "./async-queue.js";
@@ -17,7 +21,7 @@ type EventFields<T extends AgentEvent["type"]> = Extract<
 
 type OutcomeSpecific =
   | { status: "completed"; finalText: string; activePlanId?: string }
-  | { status: "stopped"; reason: "step_limit_reached" | "unknown_tool_loop"; finalizationText?: string }
+  | { status: "stopped"; reason: "step_limit_reached" | "unknown_tool_loop" | "permission_denial_loop"; finalizationText?: string }
   | { status: "cancelled" }
   | { status: "model_stopped"; reason: "length" | "content_filter" | "other" | "empty_response" | "protocol_error"; failedStep?: number }
   | { status: "model_failed"; message: string; failedStep?: number }
@@ -33,6 +37,14 @@ export interface AgentSessionDependencies {
   readonly idFactory?: () => string;
   readonly clock?: () => Date;
   readonly maxSteps?: number;
+  readonly promptContext?: {
+    readonly permissionMode: "strict" | "plan" | "default" | "acceptEdit" | "permissive";
+    readonly environment: PromptEnvironment;
+    readonly environmentProvider?: () => PromptEnvironment;
+    readonly customInstructions?: string;
+    readonly skills?: readonly string[];
+    readonly longTermMemory?: string;
+  };
 }
 
 export class AgentSession {
@@ -138,7 +150,9 @@ export class AgentSession {
     } as AgentOutcome);
     let stepsCompleted = 0;
     let consecutiveUnknownBatches = 0;
-    let stopReason: "step_limit_reached" | "unknown_tool_loop" | undefined;
+    let previousDenial: string | undefined;
+    let consecutiveDenials = 0;
+    let stopReason: "step_limit_reached" | "unknown_tool_loop" | "permission_denial_loop" | undefined;
     const usedToolCallIds = collectToolCallIds(this.dependencies.conversation.getMessages());
     const maxSteps = this.dependencies.maxSteps ?? 20;
     while (stepsCompleted < maxSteps) {
@@ -151,7 +165,7 @@ export class AgentSession {
         step = await this.dependencies.model.collect({
           messages: this.dependencies.conversation.getMessages(),
           tools: exposedTools,
-          instructions: modeInstructions(taskMode),
+          systemInstructions: this.systemInstructions(taskMode, stepNumber),
           toolChoice: "auto",
           signal,
           onTextDelta: (delta) => emit("text_delta", { step: stepNumber, delta }),
@@ -274,6 +288,20 @@ export class AgentSession {
         stopReason = "unknown_tool_loop";
         break;
       }
+      const denial = denialIdentity(batch.results);
+      if (denial === undefined) {
+        previousDenial = undefined;
+        consecutiveDenials = 0;
+      } else if (denial === previousDenial) {
+        consecutiveDenials++;
+      } else {
+        previousDenial = denial;
+        consecutiveDenials = 1;
+      }
+      if (consecutiveDenials >= 3) {
+        stopReason = "permission_denial_loop";
+        break;
+      }
     }
     stopReason ??= "step_limit_reached";
     let finalization;
@@ -281,7 +309,11 @@ export class AgentSession {
       finalization = await this.dependencies.model.collect({
         messages: this.dependencies.conversation.getMessages(),
         tools: [],
-        instructions: boundedFinalizationInstructions(stopReason),
+        systemInstructions: this.systemInstructions(
+          taskMode,
+          stepsCompleted + 1,
+          boundedFinalizationInstructions(stopReason)
+        ),
         toolChoice: "none",
         signal,
         onTextDelta: (delta) => emit("text_delta", { finalization: true, delta }),
@@ -317,6 +349,31 @@ export class AgentSession {
   private now(): string {
     return (this.dependencies.clock?.() ?? new Date()).toISOString();
   }
+
+  private systemInstructions(
+    taskMode: TaskMode,
+    modelCallNumber: number,
+    callInstructions?: string
+  ): string[] {
+    const configured = this.dependencies.promptContext;
+    return buildSupplementalSystemTexts({
+      taskMode,
+      permissionMode: configured?.permissionMode ?? "default",
+      modelCallNumber,
+      environment: safeEnvironment(
+        configured?.environmentProvider,
+        configured?.environment ?? defaultEnvironment(this.dependencies.workspace, this.now())
+      ),
+      ...(configured?.customInstructions === undefined
+        ? {}
+        : { customInstructions: configured.customInstructions }),
+      ...(configured?.skills === undefined ? {} : { skills: configured.skills }),
+      ...(configured?.longTermMemory === undefined
+        ? {}
+        : { longTermMemory: configured.longTermMemory }),
+      ...(callInstructions === undefined ? {} : { callInstructions }),
+    });
+  }
 }
 
 function visibleTools(registry: ToolRegistry, mode: TaskMode) {
@@ -326,14 +383,47 @@ function visibleTools(registry: ToolRegistry, mode: TaskMode) {
     : definitions.filter(({ name }) => ["read_file", "find_files", "search_text", "run_command"].includes(name));
 }
 
-function modeInstructions(mode: TaskMode): string {
-  return mode === "plan"
-    ? "Investigate only. Do not use write tools. Request only read-only commands and produce a structured plan."
-    : "Continue executing until the task is naturally complete.";
+function boundedFinalizationInstructions(reason: "step_limit_reached" | "unknown_tool_loop" | "permission_denial_loop"): string {
+  return `Do not use tools. The run stopped because ${reason}. State the stop reason, completed work, unfinished work, and recommended next step.`;
 }
 
-function boundedFinalizationInstructions(reason: "step_limit_reached" | "unknown_tool_loop"): string {
-  return `Do not use tools. The run stopped because ${reason}. State the stop reason, completed work, unfinished work, and recommended next step.`;
+function denialIdentity(results: readonly import("../tools/runner.js").ToolCallResult[]): string | undefined {
+  if (results.length !== 1) return undefined;
+  const result = results[0]?.result;
+  if (result?.ok !== false) return undefined;
+  if (result.error.code !== "permission_denied" && result.error.code !== "approval_denied") {
+    return undefined;
+  }
+  const details = result.error.details;
+  if (typeof details !== "object" || details === null || !("authorizationTarget" in details)) {
+    return undefined;
+  }
+  return `${result.error.code}:${JSON.stringify(details.authorizationTarget)}`;
+}
+
+function defaultEnvironment(workspace: string, timestamp: string): PromptEnvironment {
+  return {
+    workspace,
+    platform: process.platform,
+    architecture: process.arch,
+    shell: process.platform === "win32" ? "powershell" : "sh",
+    gitRepository: "unavailable",
+    gitBranch: "unavailable",
+    model: "unavailable",
+    localDate: timestamp.slice(0, 10),
+  };
+}
+
+function safeEnvironment(
+  provider: (() => PromptEnvironment) | undefined,
+  fallback: PromptEnvironment
+): PromptEnvironment {
+  if (!provider) return fallback;
+  try {
+    return provider();
+  } catch {
+    return { ...fallback, gitRepository: "unavailable", gitBranch: "unavailable" };
+  }
 }
 
 function addUsage(total: MutableUsage, delta: ModelUsage): void {

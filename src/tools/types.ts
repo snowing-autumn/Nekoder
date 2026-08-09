@@ -55,6 +55,19 @@ export interface ToolPreparationContext {
 
 export interface ToolExecutionContext extends ToolPreparationContext {}
 
+export interface AuthorizationTarget {
+  readonly primary: string;
+  readonly cwd?: string;
+  readonly shell?: "powershell" | "sh";
+  readonly commands?: readonly string[];
+  readonly requestedPath?: string;
+  readonly resolvedPath?: string;
+  readonly dynamic?: boolean;
+  readonly sensitive?: boolean;
+  readonly dangerous?: boolean;
+  readonly protectedWritePath?: "permission_control_plane" | "git_metadata";
+}
+
 export interface Tool<I, P, O> {
   readonly name: ToolName;
   readonly description: string;
@@ -62,6 +75,10 @@ export interface Tool<I, P, O> {
   readonly inputSchema: ToolInputSchema;
   readonly timeoutMs: number;
   prepare(input: I, context: ToolPreparationContext): Promise<ToolResult<P>>;
+  authorizationTarget?(
+    prepared: P,
+    context: ToolPreparationContext
+  ): Promise<ToolResult<AuthorizationTarget>>;
   execute(prepared: P, context: ToolExecutionContext): Promise<ToolResult<O>>;
 }
 

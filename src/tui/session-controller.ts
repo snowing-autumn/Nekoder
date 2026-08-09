@@ -1,9 +1,12 @@
 import type { AgentSession } from "../agent/session.js";
 import type { AgentEvent, AgentRunHandle, TaskMode } from "../agent/types.js";
 import type { ApprovalBroker, PendingApproval } from "./approval-broker.js";
+import type { PermissionMode } from "../security/types.js";
+import type { ApprovalDecision } from "../security/types.js";
 
 export interface SessionSnapshot {
   readonly taskMode: TaskMode;
+  readonly permissionMode: PermissionMode;
   readonly runStatus: "idle" | "running";
   readonly activePlanId?: string;
   readonly pendingApproval?: PendingApproval;
@@ -27,10 +30,7 @@ export type ControllerResult =
     };
 
 export class SessionController {
-  private snapshot: SessionSnapshot = {
-    taskMode: "execute",
-    runStatus: "idle",
-  };
+  private snapshot: SessionSnapshot;
   private activeHandle: AgentRunHandle | undefined;
   private activeTask: Promise<void> | undefined;
   private readonly eventListeners = new Set<(event: AgentEvent) => void>();
@@ -39,8 +39,10 @@ export class SessionController {
 
   constructor(
     private readonly session: AgentSession,
-    private readonly approvalBroker?: ApprovalBroker
+    private readonly approvalBroker?: ApprovalBroker,
+    permissionMode: PermissionMode = "default"
   ) {
+    this.snapshot = { taskMode: "execute", permissionMode, runStatus: "idle" };
     this.unsubscribeApproval = approvalBroker?.subscribe((pendingApproval) => {
       this.setSnapshot({
         ...this.snapshot,
@@ -80,13 +82,13 @@ export class SessionController {
         return { ok: false, code: "no_active_plan", message: "No active plan" };
       }
       const handle = this.session.executeActivePlan();
-      this.setSnapshot({ taskMode: "execute", runStatus: "running" });
+      this.setSnapshot({ ...this.snapshot, taskMode: "execute", runStatus: "running" });
       this.track(handle);
       return { ok: true, action: "run_started", agentRunId: handle.agentRunId };
     }
 
     const handle = this.session.startUserRun(rawText, this.snapshot.taskMode);
-    this.setSnapshot({ taskMode: this.snapshot.taskMode, runStatus: "running" });
+    this.setSnapshot({ ...this.snapshot, taskMode: this.snapshot.taskMode, runStatus: "running" });
     this.track(handle);
     return { ok: true, action: "run_started", agentRunId: handle.agentRunId };
   }
@@ -98,6 +100,11 @@ export class SessionController {
   resolveApproval(approved: boolean): boolean {
     const pending = this.approvalBroker?.getPending();
     return pending ? this.approvalBroker!.resolve(pending.requestId, approved) : false;
+  }
+
+  resolveApprovalDecision(decision: ApprovalDecision): boolean {
+    const pending = this.approvalBroker?.getPending();
+    return pending ? this.approvalBroker!.resolve(pending.requestId, decision) : false;
   }
 
   dispose(): void {
@@ -118,6 +125,7 @@ export class SessionController {
       }
       const outcome = await handle.result;
       this.setSnapshot({
+        permissionMode: this.snapshot.permissionMode,
         taskMode: this.snapshot.taskMode,
         runStatus: "idle",
         ...(outcome.status === "completed" && outcome.activePlanId

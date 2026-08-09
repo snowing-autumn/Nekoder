@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
+import { classifyProtectedWritePath } from "../security/protected-path.js";
 import type { Tool } from "./types.js";
 import {
   failure,
@@ -25,7 +26,7 @@ interface PreparedWriteFile extends PreparedPath {
 
 export const writeFileTool: Tool<WriteFileInput, PreparedWriteFile, unknown> = {
   name: "write_file",
-  description: "Create or atomically replace a UTF-8 text file in the workspace.",
+  description: "Create or atomically replace a UTF-8 text file in the workspace. Use read_file first before overwriting and prefer dedicated file tools over shell redirection.",
   effect: "write",
   timeoutMs: 10_000,
   inputSchema: {
@@ -55,9 +56,26 @@ export const writeFileTool: Tool<WriteFileInput, PreparedWriteFile, unknown> = {
       },
     };
   },
+  async authorizationTarget(prepared, context) {
+    const resolved = await resolveWritableWorkspacePath(context.workspace, prepared);
+    if (!resolved.ok) return resolved;
+    const protectedWritePath = classifyProtectedWritePath(resolved.data.resolvedPath);
+    return {
+      ok: true,
+      data: {
+        primary: resolved.data.resolvedPath,
+        requestedPath: prepared.requestedPath,
+        resolvedPath: resolved.data.resolvedPath,
+        ...(protectedWritePath === undefined ? {} : { protectedWritePath }),
+      },
+    };
+  },
   async execute(prepared, context) {
     const resolved = await resolveWritableWorkspacePath(context.workspace, prepared);
     if (!resolved.ok) return resolved;
+    if (classifyProtectedWritePath(resolved.data.resolvedPath)) {
+      return failure("permission_denied", "Protected control-plane paths cannot be modified");
+    }
     const target = resolved.data.absolutePath;
     let existed = false;
     let mode: number | undefined;

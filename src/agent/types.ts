@@ -22,7 +22,7 @@ export interface AgentOutcomeBase {
 export type AgentOutcome = AgentOutcomeBase &
   (
     | { readonly status: "completed"; readonly finalText: string; readonly activePlanId?: string }
-    | { readonly status: "stopped"; readonly reason: "step_limit_reached" | "unknown_tool_loop"; readonly finalizationText?: string }
+    | { readonly status: "stopped"; readonly reason: "step_limit_reached" | "unknown_tool_loop" | "permission_denial_loop"; readonly finalizationText?: string }
     | { readonly status: "cancelled" }
     | {
         readonly status: "model_stopped";

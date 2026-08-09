@@ -45,6 +45,7 @@ export interface ModelCollectRequest {
   readonly messages: readonly ModelMessage[];
   readonly tools: readonly ModelToolDefinition[];
   readonly instructions?: string;
+  readonly systemInstructions?: readonly string[];
   readonly toolChoice?: "auto" | "none";
   readonly signal?: AbortSignal;
   readonly onTextDelta?: (delta: string) => void | Promise<void>;

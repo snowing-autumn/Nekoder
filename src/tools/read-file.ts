@@ -2,10 +2,12 @@ import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 
 import type { Tool } from "./types.js";
+import { isSensitiveWorkspacePath } from "../security/sensitive-path.js";
 import {
   failure,
   prepareWorkspacePath,
   resolveExistingWorkspacePath,
+  resolveWritableWorkspacePath,
   type PreparedPath,
 } from "./workspace.js";
 
@@ -22,7 +24,10 @@ interface PreparedReadFile extends PreparedPath {
   readonly maxLines: number;
 }
 
-export const readFileTool: Tool<ReadFileInput, PreparedReadFile, unknown> = {
+export function createReadFileTool(
+  sensitiveReads: readonly string[] = []
+): Tool<ReadFileInput, PreparedReadFile, unknown> {
+  return {
   name: "read_file",
   description: "Read a bounded page of a UTF text file in the workspace.",
   effect: "read",
@@ -48,6 +53,24 @@ export const readFileTool: Tool<ReadFileInput, PreparedReadFile, unknown> = {
         startLine: input.startLine ?? 1,
         startColumn: input.startColumn ?? 1,
         maxLines: input.maxLines ?? 2000,
+      },
+    };
+  },
+  async authorizationTarget(prepared, context) {
+    let resolved = await resolveExistingWorkspacePath(context.workspace, prepared);
+    if (!resolved.ok && resolved.error.code === "not_found") {
+      resolved = await resolveWritableWorkspacePath(context.workspace, prepared);
+    }
+    if (!resolved.ok) return resolved;
+    return {
+      ok: true,
+      data: {
+        primary: resolved.data.resolvedPath,
+        requestedPath: prepared.requestedPath,
+        resolvedPath: resolved.data.resolvedPath,
+        ...(isSensitiveWorkspacePath(resolved.data.resolvedPath, sensitiveReads)
+          ? { sensitive: true }
+          : {}),
       },
     };
   },
@@ -111,7 +134,10 @@ export const readFileTool: Tool<ReadFileInput, PreparedReadFile, unknown> = {
       return failure("filesystem_error", `Unable to read file: ${String(error)}`, true);
     }
   },
-};
+  };
+}
+
+export const readFileTool = createReadFileTool();
 
 function splitLines(text: string): string[] {
   if (text === "") return [];

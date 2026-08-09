@@ -52,6 +52,18 @@ export function createFindFilesTool(
       data: { ...path.data, pattern: input.pattern, caseSensitive: input.caseSensitive ?? true },
     };
   },
+  async authorizationTarget(prepared, context) {
+    const resolved = await resolveExistingWorkspacePath(context.workspace, prepared);
+    if (!resolved.ok) return resolved;
+    return {
+      ok: true,
+      data: {
+        primary: resolved.data.resolvedPath,
+        requestedPath: prepared.requestedPath,
+        resolvedPath: resolved.data.resolvedPath,
+      },
+    };
+  },
   async execute(prepared, context) {
     const start = await resolveExistingWorkspacePath(context.workspace, prepared);
     if (!start.ok) return start;

@@ -86,16 +86,9 @@ export class LLMClient implements ModelInvoker {
       ])
     );
     const hasTools = Object.keys(tools).length > 0;
-    const instructions = request.instructions
-      ? `${this.systemPrompt}\n\n${request.instructions}`
-      : this.systemPrompt;
     const result = streamText({
       model: this.model,
-      instructions: {
-        role: "system",
-        content: instructions,
-        ...(this.isAnthropic ? { providerOptions: EPHEMERAL } : {}),
-      },
+      instructions: buildProviderInstructions(this.systemPrompt, request, this.isAnthropic),
       messages: this.isAnthropic
         ? withLastUserCached([...request.messages])
         : [...request.messages],
@@ -196,6 +189,39 @@ export class LLMClient implements ModelInvoker {
       ...(this.isAnthropic ? { providerOptions: EPHEMERAL } : {}),
     };
   }
+}
+
+export function assembleSystemContent(
+  stableSystemPrompt: string,
+  request: Pick<ModelCollectRequest, "systemInstructions" | "instructions">
+): string {
+  return [
+    stableSystemPrompt,
+    ...(request.systemInstructions ?? []),
+    ...(request.instructions === undefined ? [] : [request.instructions]),
+  ].filter((part) => part.length > 0).join("\n\n");
+}
+
+export function buildProviderInstructions(
+  stableSystemPrompt: string,
+  request: Pick<ModelCollectRequest, "systemInstructions" | "instructions">,
+  anthropic: boolean
+): SystemModelMessage[] {
+  const stable: SystemModelMessage = {
+    role: "system",
+    content: stableSystemPrompt,
+    ...(anthropic ? { providerOptions: EPHEMERAL } : {}),
+  };
+  return [
+    stable,
+    ...(request.systemInstructions ?? []).map((content): SystemModelMessage => ({
+      role: "system",
+      content,
+    })),
+    ...(request.instructions === undefined
+      ? []
+      : [{ role: "system" as const, content: request.instructions }]),
+  ].filter(({ content }) => content.length > 0);
 }
 
 function normalizeFinishReason(reason: string): NekoderFinishReason {

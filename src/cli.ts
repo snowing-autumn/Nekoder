@@ -1,8 +1,11 @@
 import { AgentSession } from "./agent/session.js";
-import { ModeToolAuthorizer } from "./agent/mode-authorizer.js";
 import { loadConfig, resolveModelLimits } from "./config/config.js";
 import { ConversationManager } from "./conversation/conversation.js";
 import { LLMClient } from "./llm/client.js";
+import { buildStableSystemPrompt } from "./prompt/assembler.js";
+import { collectPromptEnvironment } from "./prompt/environment.js";
+import { loadWorkspaceSecurity } from "./security/runtime.js";
+import { PermissionRuleFileStore } from "./security/permission-store.js";
 import { createCoreToolRegistry } from "./tools/core.js";
 import { ToolRunner } from "./tools/runner.js";
 import { ApprovalBroker } from "./tui/approval-broker.js";
@@ -99,16 +102,18 @@ export async function runCli(
 
 async function createConfiguredController(workspace: string): Promise<SessionController> {
   const config = loadConfig(workspace);
+  const security = loadWorkspaceSecurity(workspace);
   const provider = config.providers[0];
   if (!provider) throw new Error("No model provider is configured");
   const limits = await resolveModelLimits(provider);
   const model = new LLMClient(
     provider,
-    "You are Nekoder, a terminal coding agent. Never reveal hidden reasoning.",
+    buildStableSystemPrompt(),
     limits
   );
   const registry = createCoreToolRegistry({
     skipDirs: config.tools.skip_dirs,
+    sensitiveReads: security.config.sensitiveReads,
     ...(config.tools.run_command ? {
       runCommand: {
         ...(config.tools.run_command.env_passthrough
@@ -121,9 +126,16 @@ async function createConfiguredController(workspace: string): Promise<SessionCon
     } : {}),
   });
   const approvalBroker = new ApprovalBroker();
+  const shell = config.tools.run_command?.shell?.kind
+    ?? (process.platform === "win32" ? "powershell" : "sh");
+  const environment = () => collectPromptEnvironment(workspace, {
+    model: provider.model,
+    shell,
+  });
   const runner = new ToolRunner(registry, {
-    authorizer: new ModeToolAuthorizer(),
+    authorizer: security.policy,
     approvalHandler: approvalBroker,
+    persistentRuleWriter: new PermissionRuleFileStore(workspace),
     maxParallelReads: config.tools.max_parallel_reads,
   });
   const session = new AgentSession({
@@ -133,6 +145,14 @@ async function createConfiguredController(workspace: string): Promise<SessionCon
     conversation: new ConversationManager(),
     workspace,
     maxSteps: config.agent.max_steps,
+    promptContext: {
+      permissionMode: security.config.mode,
+      ...(config.prompt.custom_instructions
+        ? { customInstructions: config.prompt.custom_instructions }
+        : {}),
+      environment: environment(),
+      environmentProvider: environment,
+    },
   });
-  return new SessionController(session, approvalBroker);
+  return new SessionController(session, approvalBroker, security.config.mode);
 }

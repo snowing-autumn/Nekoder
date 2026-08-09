@@ -74,6 +74,11 @@ export interface Config {
   enable_coordinator_mode: boolean;
   tools: ToolsConfig;
   agent: AgentConfig;
+  prompt: PromptConfig;
+}
+
+export interface PromptConfig {
+  custom_instructions?: string;
 }
 
 export interface ToolsConfig {
@@ -103,8 +108,9 @@ export function loadConfig(
       throw new ConfigError(`检测到旧配置目录 ${legacy}；请迁移到 .nekoder，Nekoder 不会自动加载或移动旧配置。`);
     }
   }
+  const userConfigPath = join(home, ".nekoder", "config.yaml");
   const paths = [
-    join(home, ".nekoder", "config.yaml"),
+    userConfigPath,
     join(cwd, "config.yaml"),
     join(cwd, ".nekoder", "config.yaml"),
   ].filter((path) => existsSync(path));
@@ -122,7 +128,7 @@ export function loadConfig(
     } catch (err) {
       throw new ConfigError(`解析 ${path} 失败：${String(err)}`);
     }
-    validatePartialConfig(raw, path);
+    validatePartialConfig(raw, path, path === userConfigPath);
     merged = deepMerge(merged, raw as Record<string, unknown>);
   }
   return parseConfig(merged, paths.join(" + "));
@@ -134,6 +140,7 @@ const ROOT_KEYS = new Set([
   "enable_coordinator_mode",
   "tools",
   "agent",
+  "prompt",
 ]);
 const PROVIDER_KEYS = new Set([
   "name",
@@ -147,7 +154,7 @@ const PROVIDER_KEYS = new Set([
   "max_output_tokens",
 ]);
 
-function validatePartialConfig(raw: unknown, path: string): void {
+function validatePartialConfig(raw: unknown, path: string, userGlobal: boolean): void {
   if (!isPlainObject(raw)) throw new ConfigError(`${path} 顶层必须是对象。`);
   rejectUnknown(raw, ROOT_KEYS, path);
   if (raw.providers !== undefined) {
@@ -186,6 +193,20 @@ function validatePartialConfig(raw: unknown, path: string): void {
     const maxSteps = raw.agent.max_steps;
     if (maxSteps !== undefined && (!Number.isInteger(maxSteps) || Number(maxSteps) < 1 || Number(maxSteps) > 50)) {
       throw new ConfigError(`${path} agent.max_steps 必须是 1–50 的整数。`);
+    }
+  }
+  if (raw.prompt !== undefined) {
+    if (!userGlobal) throw new ConfigError(`${path} cannot provide system-level prompt instructions`);
+    if (!isPlainObject(raw.prompt)) throw new ConfigError(`${path} prompt must be an object`);
+    rejectUnknown(raw.prompt, new Set(["custom_instructions"]), `${path} prompt`);
+    if (
+      raw.prompt.custom_instructions !== undefined
+      && (
+        typeof raw.prompt.custom_instructions !== "string"
+        || Buffer.byteLength(raw.prompt.custom_instructions, "utf8") > 32 * 1024
+      )
+    ) {
+      throw new ConfigError(`${path} prompt.custom_instructions must be a string up to 32 KiB`);
     }
   }
   if (raw.tools !== undefined) {
@@ -255,6 +276,7 @@ function parseConfig(raw: unknown, path: string): Config {
       ...(root?.tools?.run_command === undefined ? {} : { run_command: root.tools.run_command }),
     },
     agent: { max_steps: root?.agent?.max_steps ?? 20 },
+    prompt: root?.prompt ?? {},
   };
 }
 

@@ -2,14 +2,18 @@ import type {
   ApprovalHandler,
   ToolAuthorizationRequest,
 } from "../tools/runner.js";
+import type { ApprovalDecision, AuthorizationDecision } from "../security/types.js";
+
+type AskDecision = Extract<AuthorizationDecision, { readonly kind: "ask" }>;
 
 export interface PendingApproval {
   readonly requestId: string;
   readonly request: ToolAuthorizationRequest;
+  readonly authorizationDecision?: AskDecision;
 }
 
 interface PendingEntry extends PendingApproval {
-  readonly finish: (approved: boolean) => void;
+  readonly finish: (decision: ApprovalDecision) => void;
   readonly onAbort?: () => void;
 }
 
@@ -19,26 +23,30 @@ export class ApprovalBroker implements ApprovalHandler {
 
   constructor(private readonly idFactory: () => string = () => crypto.randomUUID()) {}
 
-  requestApproval(request: ToolAuthorizationRequest): Promise<boolean> {
+  requestApproval(
+    request: ToolAuthorizationRequest,
+    authorizationDecision?: AskDecision
+  ): Promise<ApprovalDecision> {
     if (this.pending) throw new Error("An approval request is already pending");
-    if (request.signal?.aborted) return Promise.resolve(false);
+    if (request.signal?.aborted) return Promise.resolve({ kind: "deny" });
 
-    return new Promise<boolean>((resolve) => {
+    return new Promise<ApprovalDecision>((resolve) => {
       const requestId = this.idFactory();
-      const finish = (approved: boolean): void => {
+      const finish = (decision: ApprovalDecision): void => {
         if (this.pending?.requestId !== requestId) return;
         if (this.pending.onAbort && request.signal) {
           request.signal.removeEventListener("abort", this.pending.onAbort);
         }
         this.pending = undefined;
         this.notify();
-        resolve(approved);
+        resolve(decision);
       };
-      const onAbort = request.signal ? () => finish(false) : undefined;
+      const onAbort = request.signal ? () => finish({ kind: "deny" }) : undefined;
       this.pending = {
         requestId,
         request,
         finish,
+        ...(authorizationDecision ? { authorizationDecision } : {}),
         ...(onAbort ? { onAbort } : {}),
       };
       this.notify();
@@ -48,12 +56,22 @@ export class ApprovalBroker implements ApprovalHandler {
 
   getPending(): PendingApproval | undefined {
     if (!this.pending) return undefined;
-    return { requestId: this.pending.requestId, request: this.pending.request };
+    return {
+      requestId: this.pending.requestId,
+      request: this.pending.request,
+      ...(this.pending.authorizationDecision
+        ? { authorizationDecision: this.pending.authorizationDecision }
+        : {}),
+    };
   }
 
-  resolve(requestId: string, approved: boolean): boolean {
+  resolve(requestId: string, decision: boolean | ApprovalDecision): boolean {
     if (!this.pending || this.pending.requestId !== requestId) return false;
-    this.pending.finish(approved);
+    this.pending.finish(
+      typeof decision === "boolean"
+        ? { kind: decision ? "allow_once" : "deny" }
+        : decision
+    );
     return true;
   }
 
@@ -63,7 +81,7 @@ export class ApprovalBroker implements ApprovalHandler {
   }
 
   dispose(): void {
-    this.pending?.finish(false);
+    this.pending?.finish({ kind: "deny" });
   }
 
   private notify(): void {

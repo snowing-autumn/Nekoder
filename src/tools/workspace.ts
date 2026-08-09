@@ -25,7 +25,7 @@ export function prepareWorkspacePath(
 export async function resolveExistingWorkspacePath(
   workspace: string,
   prepared: PreparedPath
-): Promise<ToolResult<{ absolutePath: string; path: string }>> {
+): Promise<ToolResult<{ absolutePath: string; path: string; resolvedPath: string }>> {
   try {
     const realWorkspace = await realpath(workspace);
     const requested = resolve(workspace, prepared.requestedPath);
@@ -39,6 +39,7 @@ export async function resolveExistingWorkspacePath(
       data: {
         absolutePath: target,
         path: prepared.requestedPath.split("\\").join("/"),
+        resolvedPath: (rel || ".").split(sep).join("/"),
       },
     };
   } catch (error) {
@@ -51,7 +52,7 @@ export async function resolveExistingWorkspacePath(
 export async function resolveWritableWorkspacePath(
   workspace: string,
   prepared: PreparedPath
-): Promise<ToolResult<{ absolutePath: string; path: string }>> {
+): Promise<ToolResult<{ absolutePath: string; path: string; resolvedPath: string }>> {
   const requested = resolve(workspace, prepared.requestedPath);
   let existing = requested;
   const tail: string[] = [];
@@ -64,7 +65,11 @@ export async function resolveWritableWorkspacePath(
       if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return pathOutside();
       return {
         ok: true,
-        data: { absolutePath: target, path: prepared.requestedPath.split("\\").join("/") },
+        data: {
+          absolutePath: target,
+          path: prepared.requestedPath.split("\\").join("/"),
+          resolvedPath: (rel || ".").split(sep).join("/"),
+        },
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {

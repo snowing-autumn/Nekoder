@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { chmod, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
+import { classifyProtectedWritePath } from "../security/protected-path.js";
 import type { Tool } from "./types.js";
 import {
   failure,
@@ -23,7 +24,7 @@ interface PreparedEditFile extends PreparedPath {
 
 export const editFileTool: Tool<EditFileInput, PreparedEditFile, unknown> = {
   name: "edit_file",
-  description: "Replace exactly one matching text fragment in a workspace file.",
+  description: "Replace exactly one matching text fragment in a workspace file. Use read_file first and prefer this dedicated editor over shell text rewriting.",
   effect: "write",
   timeoutMs: 10_000,
   inputSchema: {
@@ -41,9 +42,26 @@ export const editFileTool: Tool<EditFileInput, PreparedEditFile, unknown> = {
     if (!path.ok) return path;
     return { ok: true, data: { ...path.data, oldText: input.oldText, newText: input.newText } };
   },
+  async authorizationTarget(prepared, context) {
+    const resolved = await resolveExistingWorkspacePath(context.workspace, prepared);
+    if (!resolved.ok) return resolved;
+    const protectedWritePath = classifyProtectedWritePath(resolved.data.resolvedPath);
+    return {
+      ok: true,
+      data: {
+        primary: resolved.data.resolvedPath,
+        requestedPath: prepared.requestedPath,
+        resolvedPath: resolved.data.resolvedPath,
+        ...(protectedWritePath === undefined ? {} : { protectedWritePath }),
+      },
+    };
+  },
   async execute(prepared, context) {
     const resolved = await resolveExistingWorkspacePath(context.workspace, prepared);
     if (!resolved.ok) return resolved;
+    if (classifyProtectedWritePath(resolved.data.resolvedPath)) {
+      return failure("permission_denied", "Protected control-plane paths cannot be modified");
+    }
     try {
       const info = await stat(resolved.data.absolutePath);
       if (!info.isFile()) return failure("not_a_file", "Path is not a file");

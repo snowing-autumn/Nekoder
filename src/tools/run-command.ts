@@ -2,6 +2,7 @@ import { stat } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 
 import type { Tool } from "./types.js";
+import { analyzeCommand, destroysWorkspaceRoot } from "../security/command-analysis.js";
 import {
   failure,
   prepareWorkspacePath,
@@ -39,7 +40,7 @@ export function createRunCommandTool(
   );
   return {
   name: "run_command",
-  description: "Run a non-interactive platform shell command from the workspace.",
+  description: "Run a non-interactive platform shell command from the workspace. Prefer dedicated read, search, and edit tools whenever they can perform the operation.",
   effect: "execute",
   timeoutMs: 120_000,
   inputSchema: {
@@ -58,6 +59,27 @@ export function createRunCommandTool(
     const cwd = prepareWorkspacePath(context.workspace, input.cwd ?? ".");
     if (!cwd.ok) return cwd;
     return { ok: true, data: { ...cwd.data, command: input.command } };
+  },
+  async authorizationTarget(prepared, context) {
+    const cwd = await resolveExistingWorkspacePath(context.workspace, prepared);
+    if (!cwd.ok) return cwd;
+    const shellKind = options.shell?.kind ?? (process.platform === "win32" ? "powershell" : "sh");
+    const analysis = analyzeCommand(prepared.command, shellKind);
+    if (analysis.syntaxError) return failure("invalid_input", analysis.syntaxError);
+    return {
+      ok: true,
+      data: {
+          primary: analysis.normalized,
+          commands: analysis.commands,
+        cwd: cwd.data.resolvedPath,
+        shell: shellKind,
+        ...(analysis.dynamic ? { dynamic: true } : {}),
+          ...(analysis.dangerous || (
+            cwd.data.resolvedPath === "."
+            && destroysWorkspaceRoot(prepared.command, shellKind)
+          ) ? { dangerous: true } : {}),
+      },
+    };
   },
   async execute(prepared, context) {
     const cwd = await resolveExistingWorkspacePath(context.workspace, prepared);
