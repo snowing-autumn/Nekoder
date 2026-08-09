@@ -3,7 +3,9 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import {
   APICallError,
+  jsonSchema,
   streamText,
+  tool,
   type LanguageModel,
   type ModelMessage,
   type SystemModelMessage,
@@ -30,6 +32,12 @@ import {
   NetworkError,
   RateLimitError,
 } from "./error.js";
+import type {
+  FinishReason as NekoderFinishReason,
+  ModelCollectRequest,
+  ModelInvoker,
+  ModelStepResult,
+} from "../model/types.js";
 
 // Anthropic prompt caching 的断点标记。打在某个内容块上时，该块之前的所有内容
 // （system + 工具定义 + 历史消息）会作为前缀被缓存，下一轮命中前缀就只按缓存
@@ -37,7 +45,7 @@ import {
 // 最后一个工具定义、最后一条 user 消息末尾。
 const EPHEMERAL = { anthropic: { cacheControl: { type: "ephemeral" } } };
 
-export class LLMClient {
+export class LLMClient implements ModelInvoker {
   private readonly model: LanguageModel;
   // cache_control 断点只有 Anthropic 原生协议支持
   private readonly isAnthropic: boolean;
@@ -65,6 +73,81 @@ export class LLMClient {
 
   getContextWindow(): number {
     return this.contextWindow;
+  }
+
+  async collect(request: ModelCollectRequest): Promise<ModelStepResult> {
+    const tools: ToolSet = Object.fromEntries(
+      request.tools.map((definition) => [
+        definition.name,
+        tool({
+          description: definition.description,
+          inputSchema: jsonSchema(definition.inputSchema as never),
+        }),
+      ])
+    );
+    const hasTools = Object.keys(tools).length > 0;
+    const instructions = request.instructions
+      ? `${this.systemPrompt}\n\n${request.instructions}`
+      : this.systemPrompt;
+    const result = streamText({
+      model: this.model,
+      instructions: {
+        role: "system",
+        content: instructions,
+        ...(this.isAnthropic ? { providerOptions: EPHEMERAL } : {}),
+      },
+      messages: this.isAnthropic
+        ? withLastUserCached([...request.messages])
+        : [...request.messages],
+      maxOutputTokens: this.maxOutputTokens,
+      ...(hasTools
+        ? { tools: this.isAnthropic ? withLastToolCached(tools) : tools }
+        : {}),
+      ...(request.toolChoice ? { toolChoice: request.toolChoice } : {}),
+      ...(this.reasoning ? { reasoning: this.reasoning } : {}),
+      ...(request.signal ? { abortSignal: request.signal } : {}),
+    });
+    const collectedToolCalls: Array<{
+      toolCallId: string;
+      toolName: string;
+      input: unknown;
+    }> = [];
+    try {
+      for await (const part of result.stream) {
+        if (part.type === "error") throw classifyError(part.error);
+        if (part.type === "text-delta") request.onTextDelta?.(part.text);
+        if (part.type === "tool-call") {
+          const call = {
+            toolCallId: part.toolCallId,
+            toolName: part.toolName,
+            input: part.input,
+          };
+          collectedToolCalls.push(call);
+          request.onToolCall?.(call);
+        }
+      }
+      const [text, responseMessages, finishReason, rawFinishReason, usage, warnings] =
+        await Promise.all([
+          result.text,
+          result.responseMessages,
+          result.finishReason,
+          result.rawFinishReason,
+          result.usage,
+          result.warnings,
+        ]);
+      const rawUsage = usage as unknown as Record<string, unknown>;
+      return {
+        text,
+        toolCalls: collectedToolCalls,
+        responseMessages,
+        finishReason: normalizeFinishReason(finishReason),
+        ...(rawFinishReason === undefined ? {} : { rawFinishReason }),
+        usage: compactUsage(rawUsage),
+        warnings: warnings ?? [],
+      };
+    } catch (error) {
+      throw classifyError(error);
+    }
   }
 
   // 直接透传 AI SDK 的流式分片（text-delta / reasoning-delta / tool-input-* /
@@ -115,6 +198,40 @@ export class LLMClient {
   }
 }
 
+function normalizeFinishReason(reason: string): NekoderFinishReason {
+  return reason === "stop" ||
+    reason === "tool-calls" ||
+    reason === "length" ||
+    reason === "content-filter" ||
+    reason === "error"
+    ? reason
+    : "other";
+}
+
+function compactUsage(usage: Record<string, unknown>) {
+  const input = usage.inputTokens as Record<string, unknown> | number | undefined;
+  const output = usage.outputTokens as Record<string, unknown> | number | undefined;
+  const value = (candidate: unknown): number | undefined =>
+    typeof candidate === "number" ? candidate : undefined;
+  return {
+    ...(value(typeof input === "object" ? input?.total : input) === undefined
+      ? {}
+      : { inputTokens: value(typeof input === "object" ? input?.total : input) }),
+    ...(value(typeof output === "object" ? output?.total : output) === undefined
+      ? {}
+      : { outputTokens: value(typeof output === "object" ? output?.total : output) }),
+    ...(value(typeof output === "object" ? output?.reasoning : undefined) === undefined
+      ? {}
+      : { reasoningTokens: value(typeof output === "object" ? output?.reasoning : undefined) }),
+    ...(value(typeof input === "object" ? input?.cacheRead : undefined) === undefined
+      ? {}
+      : { cacheReadTokens: value(typeof input === "object" ? input?.cacheRead : undefined) }),
+    ...(value(typeof input === "object" ? input?.cacheWrite : undefined) === undefined
+      ? {}
+      : { cacheWriteTokens: value(typeof input === "object" ? input?.cacheWrite : undefined) }),
+  };
+}
+
 export async function createClient(
   cfg: ProviderConfig,
   systemPrompt: string
@@ -126,7 +243,7 @@ function buildModel(cfg: ProviderConfig): LanguageModel {
   const apiKey = resolveAPIKey(cfg);
   if (!apiKey) {
     throw new AuthenticationError(
-      `未找到 provider "${cfg.name}" 的 API key。请在 .mewcode/config.yaml 里设置 api_key，或配置对应的环境变量。`
+      `未找到 provider "${cfg.name}" 的 API key。请在 .nekoder/config.yaml 里设置 api_key，或配置对应的环境变量。`
     );
   }
 
