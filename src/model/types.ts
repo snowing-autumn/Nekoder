@@ -47,8 +47,8 @@ export interface ModelCollectRequest {
   readonly instructions?: string;
   readonly toolChoice?: "auto" | "none";
   readonly signal?: AbortSignal;
-  readonly onTextDelta?: (delta: string) => void;
-  readonly onToolCall?: (call: NormalizedToolCall) => void;
+  readonly onTextDelta?: (delta: string) => void | Promise<void>;
+  readonly onToolCall?: (call: NormalizedToolCall) => void | Promise<void>;
 }
 
 export interface ModelInvoker {

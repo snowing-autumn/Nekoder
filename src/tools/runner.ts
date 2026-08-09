@@ -21,7 +21,7 @@ export interface ToolBatchContext {
     readonly type: "requested" | "resolved";
     readonly request: ToolAuthorizationRequest;
     readonly approved?: boolean;
-  }) => void;
+  }) => void | Promise<void>;
   readonly usedToolCallIds?: ReadonlySet<string>;
   readonly visibleToolNames?: ReadonlySet<string>;
 }
@@ -88,6 +88,7 @@ export class ToolRunner {
     calls: readonly ToolCall[],
     context: ToolBatchContext
   ): Promise<ToolBatchResult> {
+    let emissionTail = Promise.resolve();
     const emit = (
       type: ToolEventType,
       call?: Pick<ToolCall, "toolCallId" | "toolName">,
@@ -97,7 +98,7 @@ export class ToolRunner {
           "durationMs" | "errorCode" | "submittedArgsHash" | "preparedArgsHash"
         >
       > = {}
-    ): void => {
+    ): Promise<void> => {
       const event: ToolEvent = {
         sequence: ++this.eventSequence,
         timestamp: new Date().toISOString(),
@@ -106,17 +107,21 @@ export class ToolRunner {
         ...(call === undefined ? {} : call),
         ...fields,
       };
-      for (const sink of [this.options.eventSink, context.onEvent]) {
-        try {
-          sink?.(event);
-        } catch {
-          // Observability must not change tool execution.
+      const publish = async (): Promise<void> => {
+        for (const sink of [this.options.eventSink, context.onEvent]) {
+          try {
+            await sink?.(event);
+          } catch {
+            // Observability must not change tool execution.
+          }
         }
-      }
+      };
+      emissionTail = emissionTail.then(publish);
+      return emissionTail;
     };
-    emit("batch_requested");
+    await emit("batch_requested");
     if (calls.length > 16) {
-      emit("batch_preflight_failed");
+      await emit("batch_preflight_failed");
       return {
         toolBatchId: context.toolBatchId,
         results: calls.map((call, index) => ({
@@ -153,7 +158,7 @@ export class ToolRunner {
       seenIds.add(call.toolCallId);
     });
     if (duplicateIndexes.size > 0) {
-      emit("batch_preflight_failed");
+      await emit("batch_preflight_failed");
       return {
         toolBatchId: context.toolBatchId,
         results: calls.map((call, index) => ({
@@ -194,12 +199,12 @@ export class ToolRunner {
         const index = nextPreparation++;
         if (index >= calls.length) return;
         const call = calls[index]!;
-        emit("requested", call, { submittedArgsHash: hashJson(call.input) });
+        await emit("requested", call, { submittedArgsHash: hashJson(call.input) });
         const tool = context.visibleToolNames?.has(call.toolName) === false
           ? undefined
           : this.registry.get(call.toolName);
         if (!tool) {
-          emit("validation_failed", call, { errorCode: "unknown_tool" });
+          await emit("validation_failed", call, { errorCode: "unknown_tool" });
           prepared[index] = {
             call,
             error: {
@@ -215,7 +220,7 @@ export class ToolRunner {
         }
         const validate = this.ajv.compile(tool.inputSchema);
         if (!validate(call.input)) {
-          emit("validation_failed", call, { errorCode: "invalid_input" });
+          await emit("validation_failed", call, { errorCode: "invalid_input" });
           prepared[index] = {
             call,
             error: {
@@ -250,11 +255,11 @@ export class ToolRunner {
           };
         }
         if (!preparation.ok) {
-          emit("validation_failed", call, { errorCode: preparation.error.code });
+          await emit("validation_failed", call, { errorCode: preparation.error.code });
           prepared[index] = { call, error: preparation };
           continue;
         }
-        emit("validated", call, {
+        await emit("validated", call, {
           submittedArgsHash: hashJson(call.input),
           preparedArgsHash: hashJson(preparation.data),
         });
@@ -281,31 +286,31 @@ export class ToolRunner {
       };
       const decision = await this.options.authorizer?.authorize(authorizationRequest) ?? "allow";
       if (decision === "deny") {
-        emit("authorization_denied", call, { errorCode: "permission_denied" });
+        await emit("authorization_denied", call, { errorCode: "permission_denied" });
         prepared[index] = { call, error: failure("permission_denied", "Tool call was denied") };
         continue;
       }
       if (decision === "require_approval") {
-        emit("authorization_required", call);
+        await emit("authorization_required", call);
         if (!this.options.approvalHandler) {
           prepared[index] = { call, error: failure("approval_required", "Tool call requires user approval") };
           continue;
         }
-        context.onApproval?.({ type: "requested", request: authorizationRequest });
+        await context.onApproval?.({ type: "requested", request: authorizationRequest });
         const approved = await this.options.approvalHandler.requestApproval(authorizationRequest);
-        context.onApproval?.({ type: "resolved", request: authorizationRequest, approved });
+        await context.onApproval?.({ type: "resolved", request: authorizationRequest, approved });
         if (!approved) {
-          emit("authorization_denied", call, { errorCode: "approval_denied" });
+          await emit("authorization_denied", call, { errorCode: "approval_denied" });
           prepared[index] = { call, error: failure("approval_denied", "User denied tool approval") };
           continue;
         }
       }
-      emit("authorized", call);
+      await emit("authorized", call);
     }
 
     const preflightFailed = prepared.some((entry) => "error" in entry);
     if (preflightFailed) {
-      emit("batch_preflight_failed");
+      await emit("batch_preflight_failed");
       return {
         toolBatchId: context.toolBatchId,
         results: prepared.map((entry) => ({
@@ -328,10 +333,10 @@ export class ToolRunner {
     let runtimeFailure: { callId: string; code: import("./types.js").ToolErrorCode } | undefined;
     const executeOne = async (entry: (typeof executable)[number]): Promise<ToolResult<unknown>> => {
       if (context.signal?.aborted) {
-        emit("cancelled", entry.call, { errorCode: "cancelled" });
+        await emit("cancelled", entry.call, { errorCode: "cancelled" });
         return failure("cancelled", "Tool call was cancelled");
       }
-      emit("started", entry.call);
+      await emit("started", entry.call);
       const started = performance.now();
       try {
         const executionController = new AbortController();
@@ -380,13 +385,13 @@ export class ToolRunner {
             },
           };
         }
-        emit(result.ok ? "succeeded" : result.error.code === "cancelled" ? "cancelled" : "failed", entry.call, {
+        await emit(result.ok ? "succeeded" : result.error.code === "cancelled" ? "cancelled" : "failed", entry.call, {
           durationMs: performance.now() - started,
           ...(result.ok ? {} : { errorCode: result.error.code }),
         });
         return result;
       } catch (error) {
-        emit("failed", entry.call, { durationMs: performance.now() - started, errorCode: "internal_error" });
+        await emit("failed", entry.call, { durationMs: performance.now() - started, errorCode: "internal_error" });
         return {
           ok: false,
           error: {
@@ -397,7 +402,7 @@ export class ToolRunner {
         };
       }
     };
-    emit("batch_started");
+    await emit("batch_started");
     while (index < executable.length) {
       if (runtimeFailure) {
         const entry = executable[index]!;
@@ -449,7 +454,7 @@ export class ToolRunner {
       }
       index = groupEnd;
     }
-    emit(context.signal?.aborted ? "batch_cancelled" : "batch_finished");
+    await emit(context.signal?.aborted ? "batch_cancelled" : "batch_finished");
     return {
       toolBatchId: context.toolBatchId,
       results: applyBatchOutputBudget(results),

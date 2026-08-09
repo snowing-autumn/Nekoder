@@ -6,6 +6,15 @@ import type { ToolRunner } from "../tools/runner.js";
 import { AsyncQueue } from "./async-queue.js";
 import type { AgentEvent, AgentOutcome, AgentRunHandle, RunUsage, TaskMode } from "./types.js";
 
+type EventFields<T extends AgentEvent["type"]> = Extract<
+  AgentEvent,
+  { readonly type: T }
+> extends infer Event
+  ? Event extends AgentEvent
+    ? Omit<Event, "agentRunId" | "sequence" | "timestamp" | "type">
+    : never
+  : never;
+
 type OutcomeSpecific =
   | { status: "completed"; finalText: string; activePlanId?: string }
   | { status: "stopped"; reason: "step_limit_reached" | "unknown_tool_loop"; finalizationText?: string }
@@ -70,22 +79,31 @@ export class AgentSession {
       await completion;
     });
     let sequence = 0;
-    const emit = (type: AgentEvent["type"], fields: Record<string, unknown> = {}): void => {
-      queue.push({
-        ...fields,
+    const emit = async <T extends AgentEvent["type"]>(
+      type: T,
+      fields: EventFields<T>
+    ): Promise<void> => {
+      await queue.push({
+        ...(fields as object),
         agentRunId,
         sequence: ++sequence,
         timestamp: this.now(),
         type,
-      });
+      } as Extract<AgentEvent, { readonly type: T }>);
     };
     const startedAt = this.now();
-    emit("run_started", { taskMode });
-    const result = this.run(agentRunId, taskMode, controller.signal, emit, startedAt)
-      .then((outcome) => {
-        emit("run_finished", outcome as unknown as Record<string, unknown>);
-        return outcome;
-      })
+    const result = (async () => {
+      await emit("run_started", { taskMode });
+      const outcome = await this.run(
+        agentRunId,
+        taskMode,
+        controller.signal,
+        emit,
+        startedAt
+      );
+      await emit("run_finished", outcome);
+      return outcome;
+    })()
       .finally(() => {
         this.active = false;
         queue.close();
@@ -103,7 +121,10 @@ export class AgentSession {
     agentRunId: string,
     taskMode: TaskMode,
     signal: AbortSignal,
-    emit: (type: AgentEvent["type"], fields?: Record<string, unknown>) => void,
+    emit: <T extends AgentEvent["type"]>(
+      type: T,
+      fields: EventFields<T>
+    ) => Promise<void>,
     startedAt: string
   ): Promise<AgentOutcome> {
     const usage: MutableUsage = {};
@@ -124,7 +145,7 @@ export class AgentSession {
       if (signal.aborted) return finish({ status: "cancelled" }, stepsCompleted);
       const stepNumber = stepsCompleted + 1;
       const exposedTools = visibleTools(this.dependencies.registry, taskMode);
-      emit("step_started", { step: stepNumber });
+      await emit("step_started", { step: stepNumber });
       let step;
       try {
         step = await this.dependencies.model.collect({
@@ -175,17 +196,17 @@ export class AgentSession {
         );
       }
       this.dependencies.conversation.addMessages(step.responseMessages);
-      emit("assistant_completed", { step: stepNumber });
+      await emit("assistant_completed", { step: stepNumber });
       if (step.usage) {
         addUsage(usage, step.usage);
-        emit("usage", { step: stepNumber, delta: step.usage, total: { ...usage } });
+        await emit("usage", { step: stepNumber, delta: step.usage, total: { ...usage } });
       }
       if (step.finishReason === "stop" && step.toolCalls.length === 0) {
         stepsCompleted++;
         if (!step.text.trim()) {
           return finish({ status: "model_stopped", reason: "empty_response", failedStep: stepNumber }, stepsCompleted);
         }
-        emit("step_finished", { step: stepNumber });
+        await emit("step_finished", { step: stepNumber });
         if (taskMode === "plan") {
           const activePlanId = this.dependencies.idFactory?.() ?? crypto.randomUUID();
           this.activePlan = {
@@ -236,10 +257,14 @@ export class AgentSession {
       );
       this.dependencies.conversation.addToolResults(toolParts);
       for (const item of batch.results) {
-        emit("tool_result", { step: stepNumber, toolBatchId: batch.toolBatchId, ...item });
+        await emit("tool_result", {
+          step: stepNumber,
+          toolBatchId: batch.toolBatchId,
+          ...item,
+        });
       }
       stepsCompleted++;
-      emit("step_finished", { step: stepNumber });
+      await emit("step_finished", { step: stepNumber });
       if (signal.aborted) return finish({ status: "cancelled" }, stepsCompleted);
       const allUnknown = batch.results.length > 0 && batch.results.every(
         ({ result }) => !result.ok && result.error.code === "unknown_tool"
@@ -274,10 +299,14 @@ export class AgentSession {
       return finish({ status: "finalization_failed", message: "Bounded finalization did not produce a normal non-empty response" }, stepsCompleted);
     }
     this.dependencies.conversation.addMessages(finalization.responseMessages);
-    emit("assistant_completed", { finalization: true });
+    await emit("assistant_completed", { finalization: true });
     if (finalization.usage) {
       addUsage(usage, finalization.usage);
-      emit("usage", { delta: finalization.usage, total: { ...usage }, finalization: true });
+      await emit("usage", {
+        delta: finalization.usage,
+        total: { ...usage },
+        finalization: true,
+      });
     }
     return finish(
       { status: "stopped", reason: stopReason, finalizationText: finalization.text },

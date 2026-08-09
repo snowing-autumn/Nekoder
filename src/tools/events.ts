@@ -29,4 +29,4 @@ export interface ToolEvent {
   readonly preparedArgsHash?: string;
 }
 
-export type ToolEventSink = (event: ToolEvent) => void;
+export type ToolEventSink = (event: ToolEvent) => void | Promise<void>;

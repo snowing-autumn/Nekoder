@@ -115,7 +115,7 @@ export class LLMClient implements ModelInvoker {
     try {
       for await (const part of result.stream) {
         if (part.type === "error") throw classifyError(part.error);
-        if (part.type === "text-delta") request.onTextDelta?.(part.text);
+        if (part.type === "text-delta") await request.onTextDelta?.(part.text);
         if (part.type === "tool-call") {
           const call = {
             toolCallId: part.toolCallId,
@@ -123,7 +123,7 @@ export class LLMClient implements ModelInvoker {
             input: part.input,
           };
           collectedToolCalls.push(call);
-          request.onToolCall?.(call);
+          await request.onToolCall?.(call);
         }
       }
       const [text, responseMessages, finishReason, rawFinishReason, usage, warnings] =

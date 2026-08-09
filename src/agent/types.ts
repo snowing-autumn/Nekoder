@@ -1,28 +1,14 @@
 import type { ModelUsage } from "../model/types.js";
+import type { ToolEvent } from "../tools/events.js";
+import type {
+  ToolAuthorizationRequest,
+  ToolCall,
+  ToolCallResult,
+} from "../tools/runner.js";
 
 export type TaskMode = "plan" | "execute";
 
 export interface RunUsage extends ModelUsage {}
-
-export interface AgentEvent {
-  readonly agentRunId: string;
-  readonly sequence: number;
-  readonly timestamp: string;
-  readonly type:
-    | "run_started"
-    | "step_started"
-    | "text_delta"
-    | "assistant_completed"
-    | "tool_call"
-    | "tool_event"
-    | "tool_result"
-    | "approval_requested"
-    | "approval_resolved"
-    | "usage"
-    | "step_finished"
-    | "run_finished";
-  readonly [field: string]: unknown;
-}
 
 export interface AgentOutcomeBase {
   readonly agentRunId: string;
@@ -46,6 +32,56 @@ export type AgentOutcome = AgentOutcomeBase &
     | { readonly status: "model_failed"; readonly message: string; readonly failedStep?: number }
     | { readonly status: "finalization_failed"; readonly message: string }
   );
+
+interface AgentEventBase {
+  readonly agentRunId: string;
+  readonly sequence: number;
+  readonly timestamp: string;
+}
+
+type StepOrFinalization =
+  | { readonly step: number; readonly finalization?: never }
+  | { readonly step?: never; readonly finalization: true };
+
+export type AgentEvent =
+  | (AgentEventBase & { readonly type: "run_started"; readonly taskMode: TaskMode })
+  | (AgentEventBase & { readonly type: "step_started"; readonly step: number })
+  | (AgentEventBase & { readonly type: "text_delta"; readonly delta: string } & StepOrFinalization)
+  | (AgentEventBase & { readonly type: "assistant_completed" } & StepOrFinalization)
+  | (AgentEventBase & {
+      readonly type: "tool_call";
+      readonly step: number;
+      readonly call: ToolCall;
+    })
+  | (AgentEventBase & {
+      readonly type: "tool_event";
+      readonly step: number;
+      readonly toolSequence: number;
+      readonly event: ToolEvent;
+    })
+  | (AgentEventBase & {
+      readonly type: "tool_result";
+      readonly step: number;
+      readonly toolBatchId: string;
+    } & ToolCallResult)
+  | (AgentEventBase & {
+      readonly type: "approval_requested";
+      readonly step: number;
+      readonly request: ToolAuthorizationRequest;
+    })
+  | (AgentEventBase & {
+      readonly type: "approval_resolved";
+      readonly step: number;
+      readonly request: ToolAuthorizationRequest;
+      readonly approved: boolean;
+    })
+  | (AgentEventBase & {
+      readonly type: "usage";
+      readonly delta: ModelUsage;
+      readonly total: RunUsage;
+    } & Partial<StepOrFinalization>)
+  | (AgentEventBase & { readonly type: "step_finished"; readonly step: number })
+  | (AgentEventBase & { readonly type: "run_finished" } & AgentOutcome);
 
 export interface AgentRunHandle {
   readonly agentRunId: string;
