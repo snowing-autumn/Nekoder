@@ -19,10 +19,12 @@ export interface PermissionRuleMatch {
   readonly path?: string;
 }
 
+import type { Condition } from "../extensions/condition-matcher.js";
+
 export interface PermissionRule {
   readonly id: string;
   readonly tool: string;
-  readonly match: string | PermissionRuleMatch;
+  readonly match: string | PermissionRuleMatch | Condition;
   readonly decision: "allow" | "deny";
   readonly comment?: string;
 }

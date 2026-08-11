@@ -15,7 +15,8 @@ import type { ApprovalDecision, PermissionMode } from "../security/types.js";
 import type { McpDiagnostic } from "../mcp/manager.js";
 import { createBuiltinSlashRegistry } from "../slash/builtins.js";
 import { UserInputRouter } from "../slash/dispatcher.js";
-import type { SlashCommand, SlashCommandResult } from "../slash/registry.js";
+import type { SlashCommand, SlashCommandResult, SlashRegistry } from "../slash/registry.js";
+import type { DelegatedTask } from "../extensions/delegated-task-manager.js";
 import type {
   RuntimeCommand,
   RuntimeCommandResult,
@@ -50,6 +51,11 @@ export interface StartTuiOptions {
   readonly mcpDiagnostics?: () => readonly McpDiagnostic[];
   readonly initialMessages?: readonly string[];
   readonly runtime?: WorkspaceRuntime;
+  readonly tasks?: () => readonly DelegatedTask[];
+  readonly moveTaskToBackground?: (taskId: string) => void;
+  readonly skillInstall?: (source: string, project: boolean) => Promise<string>;
+  readonly skillCreate?: (name: string, description: string, project: boolean) => Promise<string>;
+  readonly slashRegistry?: SlashRegistry;
 }
 
 export interface TuiApplication {
@@ -233,11 +239,13 @@ function NekoSidebar({
   state,
   debug,
   screenReader,
+  tasks = [],
 }: {
   readonly session: SessionSnapshot;
   readonly state: ReturnType<typeof createTuiState>;
   readonly debug?: boolean;
   readonly screenReader?: boolean;
+  readonly tasks?: readonly DelegatedTask[];
 }) {
   const visual = session.pendingApproval ? "awaiting_approval" : state.runVisualState;
   const cat = state.composer.text
@@ -267,6 +275,8 @@ function NekoSidebar({
       <Text dimColor>Cumulative</Text>
       <Text>{totalTokens(state.cumulativeUsage)}</Text>
       {session.activePlanId && <Text color={TUI_COLORS.plan}>Plan ready</Text>}
+      {tasks.length > 0 && <Text dimColor>Tasks</Text>}
+      {tasks.slice(-4).map((task) => <Text key={task.id} color={task.status === "failed" ? TUI_COLORS.danger : undefined}>{task.id.slice(0, 10)} {task.status}{task.isolation === "worktree" ? " [wt]" : ""}</Text>)}
       {debug && <Text dimColor>items {state.transcript.length}</Text>}
     </Box>
   );
@@ -288,6 +298,11 @@ function Shell({
   mcpDiagnostics,
   initialMessages = [],
   runtime,
+  tasks: taskProvider,
+  moveTaskToBackground,
+  skillInstall,
+  skillCreate,
+  slashRegistry = BUILTIN_SLASH_REGISTRY,
   onInputReady,
   onRequestExit,
 }: ShellProps) {
@@ -295,11 +310,13 @@ function Shell({
   const screenReader = process.env.INK_SCREEN_READER === "true";
   const [state, dispatch] = useReducer(reduceTuiAction, undefined, createTuiState);
   const composerRef = useRef(state.composer);
+  const selectedSlashRef = useRef<SlashCommand | undefined>(undefined);
   useEffect(() => {
     composerRef.current = state.composer;
   }, [state.composer]);
   const editComposer = (action: ComposerAction): void => {
     setCompletion(undefined);
+    selectedSlashRef.current = undefined;
     composerRef.current = applyComposerAction(composerRef.current, action);
     dispatch({ type: "composer", action });
   };
@@ -312,6 +329,7 @@ function Shell({
       end,
       text: `/${command.name}${command.argumentHint ? " " : ""}`,
     });
+    selectedSlashRef.current = command;
   };
   const [session, setSession] = useState<SessionSnapshot>(() =>
     controller?.getSnapshot() ?? { taskMode, permissionMode: "default", runStatus: "idle" }
@@ -319,6 +337,12 @@ function Shell({
   const [userConfirmation, setUserConfirmation] = useState<string>();
   const [localConfirmation, setLocalConfirmation] = useState<{ readonly id: string; readonly message: string }>();
   const [completion, setCompletion] = useState<{ readonly commands: readonly SlashCommand[]; readonly index: number }>();
+  const [tasks, setTasks] = useState<readonly DelegatedTask[]>(() => taskProvider?.() ?? []);
+  useEffect(() => {
+    if (!taskProvider) return;
+    const timer = setInterval(() => setTasks(taskProvider()), 250);
+    return () => clearInterval(timer);
+  }, [taskProvider]);
   const initialMessagesPublished = useRef(false);
   useEffect(() => {
     if (initialMessagesPublished.current) return;
@@ -344,6 +368,11 @@ function Shell({
     { isActive: !session.pendingApproval }
   );
   useInput((input, key) => {
+    if (input.toLowerCase() === "b" && session.runStatus === "running") {
+      const foreground = tasks.find((task) => task.mode === "foreground" && !["completed", "failed", "cancelled", "interrupted"].includes(task.status));
+      if (foreground) moveTaskToBackground?.(foreground.id);
+      return;
+    }
     const mouse = parseSgrMouse(input);
     if (mouse?.type === "wheel") {
       dispatch({ type: "scroll", delta: mouse.direction === "up" ? 3 : -3 });
@@ -448,7 +477,7 @@ function Shell({
     if (key.tab) {
       const slashPrefix = slashCompletionPrefix(composerRef.current);
       if (state.focus === "compose" && slashPrefix !== undefined) {
-        const commands = uniqueCompletionCommands(BUILTIN_SLASH_REGISTRY.complete(slashPrefix));
+        const commands = uniqueCompletionCommands(slashRegistry.complete(slashPrefix));
         if (commands.length === 1) {
           completeComposer(commands[0]!);
           return;
@@ -473,8 +502,16 @@ function Shell({
     if (key.return && !key.shift) {
       const text = composerRef.current.text;
       if (!text.trim() || !controller) return;
+      const slashToken = /^\/(\S+)/u.exec(text.trim())?.[1];
+      if (slashToken && !selectedSlashRef.current) {
+        const candidates = slashRegistry.candidates(slashToken);
+        if (candidates.length > 1) {
+          setCompletion({ commands: candidates, index: 0 });
+          return;
+        }
+      }
       setCompletion(undefined);
-      const slash = new UserInputRouter(BUILTIN_SLASH_REGISTRY, () => ({
+      const slash = new UserInputRouter(slashRegistry, () => ({
         runActive: controller.getSnapshot().runStatus === "running",
         enterPlanMode: () => controllerResult(controller.enterPlanMode(), "/plan"),
         executeActivePlan: async () => runtime
@@ -571,8 +608,17 @@ function Shell({
             dispatch
           );
         },
+        skillInstall: skillInstall ? async (source, project) => {
+          try { return { kind: "success", message: await skillInstall(source, project) }; }
+          catch (error) { return { kind: "blocked", code: "operation_failed", message: String(error).slice(0, 500) }; }
+        } : undefined,
+        skillCreate: skillCreate ? async (name, description, project) => {
+          try { return { kind: "success", message: await skillCreate(name, description, project) }; }
+          catch (error) { return { kind: "blocked", code: "operation_failed", message: String(error).slice(0, 500) }; }
+        } : undefined,
       }));
-      void slash.submit(text).then((result) => {
+      void slash.submit(text, selectedSlashRef.current).then((result) => {
+        selectedSlashRef.current = undefined;
         const preserveComposer = result.kind === "blocked" && result.code === "run_active";
         if (!preserveComposer) composerRef.current = createComposerBuffer();
         if (result.kind === "run_started") {
@@ -692,7 +738,7 @@ function Shell({
           </Text>
         </Box>
       </Box>
-      {columns >= 120 && <NekoSidebar session={session} state={state} debug={debug} screenReader={screenReader} />}
+      {columns >= 120 && <NekoSidebar session={session} state={state} debug={debug} screenReader={screenReader} tasks={tasks} />}
     </Box>
   );
 }
@@ -782,9 +828,9 @@ function slashCompletionPrefix(buffer: ReturnType<typeof createComposerBuffer>):
 function uniqueCompletionCommands(
   completions: ReturnType<typeof BUILTIN_SLASH_REGISTRY.complete>
 ): SlashCommand[] {
-  const commands = new Map<string, SlashCommand>();
-  for (const completion of completions) commands.set(completion.command.name, completion.command);
-  return [...commands.values()].sort((left, right) => left.name.localeCompare(right.name));
+  const commands = new Set<SlashCommand>();
+  for (const completion of completions) commands.add(completion.command);
+  return [...commands].sort((left, right) => left.name.localeCompare(right.name) || left.description.localeCompare(right.description));
 }
 
 function effectivePermission(base: PermissionMode, taskMode: TaskMode): PermissionMode {

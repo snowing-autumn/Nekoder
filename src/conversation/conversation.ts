@@ -19,6 +19,13 @@ export class ConversationManager {
     this.history.push({ role: "user", content });
   }
 
+  addAutomationMessage(origin: "hook" | "task", id: string, content: string): void {
+    this.history.push({
+      role: "user",
+      content: `<nekoder-automation origin=${JSON.stringify(origin)} id=${JSON.stringify(id)} authority="data">\n${content}\n</nekoder-automation>`,
+    });
+  }
+
   // content 可以是纯文本，也可以是 text / reasoning / tool-call part 的数组。
   // thinking 的签名放在 reasoning part 的 providerOptions.anthropic.signature
   // 上，provider 会在下一轮原样回传。
@@ -93,4 +100,12 @@ export class ConversationManager {
       anchorCount: this._anchorCount,
     };
   }
+}
+
+export interface AutomationEnvelope { readonly origin: "hook" | "task"; readonly id: string; readonly content: string }
+
+export class AutomationInbox {
+  private pending: AutomationEnvelope[] = [];
+  add(message: AutomationEnvelope): void { this.pending.push(Object.freeze({ ...message })); }
+  drain(): readonly AutomationEnvelope[] { const messages = this.pending; this.pending = []; return messages; }
 }

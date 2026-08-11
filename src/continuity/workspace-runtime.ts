@@ -59,6 +59,7 @@ export interface WorkspaceRuntimeOptions {
   readonly artifacts: ToolArtifactStore;
   readonly memoryJobs?: MemoryJobRunner;
   readonly onMemoryUpdate?: (outcome: AgentOutcome) => void | Promise<void>;
+  readonly prepareRun?: () => void | Promise<void>;
 }
 
 type PendingConfirmation =
@@ -96,6 +97,7 @@ export class WorkspaceRuntime {
 
   async startRun(input: { readonly modelText: string; readonly displayText: string }): Promise<ControllerResult> {
     if (this.options.controller.getSnapshot().runStatus === "running") return runActiveControllerResult();
+    await this.options.prepareRun?.();
     this.instructionSnapshot = await this.options.instructions.load();
     await this.options.memory.refresh();
     const result = this.options.controller.startUserRun(input.modelText);
@@ -125,6 +127,7 @@ export class WorkspaceRuntime {
     try {
       switch (command.kind) {
         case "plan.execute": {
+          await this.options.prepareRun?.();
           this.instructionSnapshot = await this.options.instructions.load();
           await this.options.memory.refresh();
           const result = this.options.controller.executeActivePlan();

@@ -28,6 +28,7 @@ export interface ToolBatchContext {
   }) => void | Promise<void>;
   readonly usedToolCallIds?: ReadonlySet<string>;
   readonly visibleToolNames?: ReadonlySet<string>;
+  readonly postAuthorizationGate?: ToolAuthorizer;
 }
 
 export type AuthorizationDecision =
@@ -65,6 +66,8 @@ export interface PersistentRuleWriter {
 
 export interface ToolRunnerOptions {
   readonly authorizer?: ToolAuthorizer;
+  /** A narrowing-only gate evaluated after permission approval and before execution. */
+  readonly postAuthorizationGate?: ToolAuthorizer;
   readonly approvalHandler?: ApprovalHandler;
   readonly persistentRuleWriter?: PersistentRuleWriter;
   readonly eventSink?: ToolEventSink;
@@ -168,6 +171,27 @@ export class ToolRunner {
                     details: { reason: "batch_limit_exceeded" },
                   },
                 },
+        })),
+      };
+    }
+    const orchestrationCalls = calls.filter(({ toolName }) =>
+      toolName === "use_skill" || toolName === "delegate_agent"
+    );
+    if (calls.length > 1 && orchestrationCalls.length > 0) {
+      await emit("batch_preflight_failed");
+      const orchestrationId = orchestrationCalls[0]!.toolCallId;
+      return {
+        toolBatchId: context.toolBatchId,
+        results: calls.map((call) => ({
+          toolCallId: call.toolCallId,
+          toolName: call.toolName,
+          result: call.toolCallId === orchestrationId
+            ? failure(
+                "orchestration_tool_must_be_exclusive",
+                `${call.toolName} must be the only call in its Tool Batch`,
+                false
+              )
+            : skipped("batch_preflight_failed", orchestrationId, "orchestration_tool_must_be_exclusive"),
         })),
       };
     }
@@ -413,6 +437,32 @@ export class ToolRunner {
         }
       }
       await emit("authorized", call);
+    }
+
+    const postAuthorizationGate = context.postAuthorizationGate ?? this.options.postAuthorizationGate;
+    if (postAuthorizationGate) {
+      for (let index = 0; index < prepared.length; index++) {
+        const entry = prepared[index]!;
+        if ("error" in entry) continue;
+        const request: ToolAuthorizationRequest = {
+          toolBatchId: context.toolBatchId,
+          toolCallId: entry.call.toolCallId,
+          toolName: entry.call.toolName,
+          effect: entry.tool.effect,
+          preparedInput: entry.data,
+          workspace: context.workspace,
+          taskMode: context.taskMode ?? "execute",
+          ...(entry.authorizationTarget === undefined ? {} : { authorizationTarget: entry.authorizationTarget }),
+          ...(context.signal === undefined ? {} : { signal: context.signal }),
+        };
+        const decision = await postAuthorizationGate.authorize(request);
+        if (decision === "deny" || decision === "require_approval" || (typeof decision === "object" && decision.kind !== "allow")) {
+          const reason = typeof decision === "object" && "reason" in decision ? decision.reason : "Tool call was denied by an Agent Loop Hook";
+          const ruleId = typeof decision === "object" && "ruleId" in decision ? decision.ruleId : undefined;
+          prepared[index] = { call: entry.call, error: failure("hook_denied", reason, false, { authorizationTarget: entry.authorizationTarget, ...(ruleId ? { hookId: ruleId } : {}) }) };
+          await emit("authorization_denied", entry.call, { errorCode: "hook_denied" });
+        }
+      }
     }
 
     const preflightFailed = prepared.some((entry) => "error" in entry);

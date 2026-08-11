@@ -9,6 +9,7 @@ import type {
   PermissionRule,
   PermissionRuleSource,
 } from "./types.js";
+import { compileCondition, type Condition } from "../extensions/condition-matcher.js";
 
 const MODES = new Set<PermissionMode>([
   "strict",
@@ -186,6 +187,14 @@ function parseMatch(
   }
   if (!isObject(raw)) {
     throw new PermissionConfigError(`${path} rules[${index}].match must be a string or object`);
+  }
+  if (["field", "not", "all", "any"].some((key) => key in raw)) {
+    try {
+      compileCondition(raw as unknown as Condition, { allowedFields: ["command", "cwd", "path", "tool"] });
+    } catch (error) {
+      throw new PermissionConfigError(`${path} rules[${index}].match is invalid: ${String(error)}`);
+    }
+    return raw as unknown as Condition;
   }
   const unknown = Object.keys(raw).find((key) => !["command", "cwd", "path"].includes(key));
   if (unknown) throw new PermissionConfigError(`${path} rules[${index}].match contains unknown field ${unknown}`);

@@ -11,7 +11,7 @@ export class UserInputRouter {
     private readonly context: () => SlashCommandContext
   ) {}
 
-  async submit(rawText: string): Promise<SlashCommandResult> {
+  async submit(rawText: string, selectedCommand?: import("./registry.js").SlashCommand): Promise<SlashCommandResult> {
     const parsed = parseSlashInput(this.registry, rawText);
     if (parsed.kind === "blank") {
       return { kind: "usage_error", message: "User input must not be blank", usage: "Enter a message or /help" };
@@ -21,6 +21,18 @@ export class UserInputRouter {
         kind: "usage_error",
         message: `Unknown Slash command: /${parsed.commandName}. Use /help to list commands.`,
         usage: "/help",
+      };
+    }
+    if (parsed.kind === "ambiguous") {
+      if (selectedCommand && parsed.candidates.includes(selectedCommand)) {
+        const context = this.context();
+        if (context.runActive && selectedCommand.allowDuringRun !== true) return runActive();
+        return selectedCommand.handle(context, parsed.args);
+      }
+      return {
+        kind: "usage_error",
+        message: `Slash name /${parsed.commandName} is ambiguous. Choose in the TUI: ${parsed.candidates.map((command) => `${command.description} (${command.destination})`).join("; ")}`,
+        usage: `/${parsed.commandName}`,
       };
     }
     const context = this.context();

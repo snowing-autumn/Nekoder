@@ -49,6 +49,7 @@ export interface PromptEnvironment {
 export interface SupplementalSystemTextOptions {
   readonly customInstructions?: string;
   readonly skills?: readonly string[];
+  readonly activeSkills?: readonly string[];
   readonly longTermMemory?: string;
   readonly taskMode: "plan" | "execute";
   readonly permissionMode: "strict" | "plan" | "default" | "acceptEdit" | "permissive";
@@ -65,10 +66,11 @@ export function buildSupplementalSystemTexts(
     assertByteLimit(options.customInstructions, 32 * 1024, "custom instructions", "32 KiB");
     blocks.push(supplement("custom-instructions", options.customInstructions));
   }
-  for (const skill of options.skills ?? []) {
+  for (const skill of [...(options.skills ?? []), ...(options.activeSkills ?? [])]) {
     assertByteLimit(skill, 64 * 1024, "skill", "64 KiB");
     blocks.push(supplement("skill", skill));
   }
+  assertByteLimit((options.activeSkills ?? []).join("\n"), 256 * 1024, "active skill instructions", "256 KiB");
   if (options.longTermMemory) {
     assertByteLimit(options.longTermMemory, 32 * 1024, "long-term memory", "32 KiB");
     blocks.push(supplement("long-term-memory", options.longTermMemory));
@@ -86,9 +88,9 @@ export function buildSupplementalSystemTexts(
   }
   assertByteLimit(
     blocks.join("\n\n"),
-    128 * 1024,
+    options.activeSkills?.length ? 512 * 1024 : 128 * 1024,
     "supplemental instructions",
-    "128 KiB"
+    options.activeSkills?.length ? "512 KiB" : "128 KiB"
   );
   return blocks;
 }

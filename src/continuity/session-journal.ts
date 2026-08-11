@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { appendFile, mkdir, readFile, readdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
+import type { DelegatedTask } from "../extensions/delegated-task-manager.js";
 
 export const SESSION_EVENT_VERSION = 1 as const;
 export const SESSION_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
@@ -36,6 +37,7 @@ export type SessionEvent =
       afterTokens?: number;
       artifactRefs?: string[];
     })
+  | (SessionEventBase & { type: "delegated_task"; task: DelegatedTask })
   | (SessionEventBase & { type: "session_closed"; reason?: string });
 
 export type SessionAppendEvent =
@@ -57,7 +59,8 @@ export type SessionAppendEvent =
       beforeTokens?: number;
       afterTokens?: number;
       artifactRefs?: string[];
-    };
+    }
+  | { type: "delegated_task"; task: DelegatedTask };
 
 export type SessionDiagnosticCode = "trailing_corrupt_line" | "invalid_middle_line";
 
@@ -126,6 +129,7 @@ const EVENT_TYPES = new Set<SessionEvent["type"]>([
   "message",
   "mode_changed",
   "compacted",
+  "delegated_task",
   "session_closed",
 ]);
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
@@ -171,6 +175,8 @@ function isValidEvent(value: unknown, sessionId: string): value is SessionEvent 
         (value.retainedFromSeq as number) >= 1 &&
         typeof value.summary === "string"
       );
+    case "delegated_task":
+      return isRecord(value.task) && typeof value.task.id === "string" && typeof value.task.status === "string";
     case "session_resumed":
     case "session_closed":
       return true;

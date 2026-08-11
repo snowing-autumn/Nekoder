@@ -168,6 +168,26 @@ export function createBuiltinSlashRegistry(): SlashRegistry {
       },
     },
     {
+      name: "skill-install", aliases: [], description: "Install a local or GitHub Agent Skill without running its code",
+      usage: "/skill-install <path|github-url> [--project]", argumentHint: "source", destination: "local", allowDuringRun: false,
+      async handle(context, args) {
+        if (!context.skillInstall) return unavailableResult("skill-install");
+        const parts = words(args); const project = parts.at(-1) === "--project"; if (project) parts.pop();
+        if (parts.length !== 1) return usage("Invalid /skill-install arguments", "/skill-install <path|github-url> [--project]");
+        return context.skillInstall(parts[0]!, project);
+      },
+    },
+    {
+      name: "skill-create", aliases: [], description: "Create a strict portable Agent Skill skeleton",
+      usage: "/skill-create <name> [description] [--project]", argumentHint: "name", destination: "local", allowDuringRun: false,
+      async handle(context, args) {
+        if (!context.skillCreate) return unavailableResult("skill-create");
+        const parts = words(args); const project = parts.at(-1) === "--project"; if (project) parts.pop();
+        if (parts.length < 1) return usage("Invalid /skill-create arguments", "/skill-create <name> [description] [--project]");
+        const name = parts.shift()!; return context.skillCreate(name, parts.join(" ") || `Use ${name}`, project);
+      },
+    },
+    {
       name: "status", aliases: ["st"], description: "Show the current Nekoder status", usage: "/status",
       destination: "local", allowDuringRun: true,
       async handle(context, args) {

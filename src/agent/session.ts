@@ -10,6 +10,8 @@ import type { ToolCallResult, ToolRunner } from "../tools/runner.js";
 import type { ModelMessage } from "ai";
 import { AsyncQueue } from "./async-queue.js";
 import type { AgentEvent, AgentOutcome, AgentRunHandle, RunUsage, TaskMode } from "./types.js";
+import type { SkillRun } from "../extensions/skill-run.js";
+import type { HookEngine, HookEvent, HookResult } from "../extensions/hook-engine.js";
 
 type EventFields<T extends AgentEvent["type"]> = Extract<
   AgentEvent,
@@ -22,7 +24,7 @@ type EventFields<T extends AgentEvent["type"]> = Extract<
 
 type OutcomeSpecific =
   | { status: "completed"; finalText: string; activePlanId?: string }
-  | { status: "stopped"; reason: "step_limit_reached" | "unknown_tool_loop" | "permission_denial_loop"; finalizationText?: string }
+  | { status: "stopped"; reason: "step_limit_reached" | "unknown_tool_loop" | "permission_denial_loop" | "hook_denial_loop"; finalizationText?: string }
   | { status: "cancelled" }
   | { status: "model_stopped"; reason: "length" | "content_filter" | "other" | "empty_response" | "protocol_error"; failedStep?: number }
   | { status: "model_failed"; message: string; failedStep?: number }
@@ -38,6 +40,10 @@ export interface AgentSessionDependencies {
   readonly idFactory?: () => string;
   readonly clock?: () => Date;
   readonly maxSteps?: number;
+  readonly skillRun?: SkillRun;
+  readonly hookEngine?: HookEngine;
+  readonly agentKind?: "root" | "subagent";
+  readonly automationInbox?: { drain(): readonly { origin: "hook" | "task"; id: string; content: string }[] };
   readonly continuity?: {
     prepareModelCall(messages: readonly ModelMessage[]): Promise<{
       readonly messages: readonly ModelMessage[];
@@ -101,6 +107,8 @@ export class AgentSession {
 
   private start(taskMode: TaskMode): AgentRunHandle {
     this.active = true;
+    this.pendingHookMessages.length = 0;
+    this.dependencies.skillRun?.begin();
     this.modelCallNumber = 0;
     const agentRunId = this.dependencies.idFactory?.() ?? crypto.randomUUID();
     const controller = new AbortController();
@@ -125,6 +133,11 @@ export class AgentSession {
     const startedAt = this.now();
     const result = (async () => {
       await emit("run_started", { taskMode });
+      this.dependencies.hookEngine?.startRun(agentRunId);
+      if (this.dependencies.hookEngine) {
+        await this.applyHooks({ type: "run_start", run: { id: agentRunId, agent: this.dependencies.agentKind ?? "root" } });
+        await this.applyHooks({ type: "message_added", run: { id: agentRunId, agent: this.dependencies.agentKind ?? "root" }, message: { role: "user", origin: "user" } });
+      }
       const outcome = await this.run(
         agentRunId,
         taskMode,
@@ -132,10 +145,13 @@ export class AgentSession {
         emit,
         startedAt
       );
+      this.drainAutomationInbox();
+      if (this.dependencies.hookEngine) await this.applyHooks({ type: "run_finish", run: { id: agentRunId, agent: this.dependencies.agentKind ?? "root" } });
       await emit("run_finished", outcome);
       return outcome;
     })()
-      .finally(() => {
+      .finally(async () => {
+        await this.dependencies.skillRun?.end();
         this.active = false;
         queue.close();
       });
@@ -171,14 +187,18 @@ export class AgentSession {
     let consecutiveUnknownBatches = 0;
     let previousDenial: string | undefined;
     let consecutiveDenials = 0;
-    let stopReason: "step_limit_reached" | "unknown_tool_loop" | "permission_denial_loop" | undefined;
+    let previousHookDenial: string | undefined;
+    let consecutiveHookDenials = 0;
+    let stopReason: "step_limit_reached" | "unknown_tool_loop" | "permission_denial_loop" | "hook_denial_loop" | undefined;
     const usedToolCallIds = collectToolCallIds(this.dependencies.conversation.getMessages());
     const maxSteps = this.dependencies.maxSteps ?? 20;
     while (stepsCompleted < maxSteps) {
       if (signal.aborted) return finish({ status: "cancelled" }, stepsCompleted);
       const stepNumber = stepsCompleted + 1;
+      this.drainAutomationInbox();
       const exposedTools = visibleTools(this.dependencies.registry, taskMode);
       await emit("step_started", { step: stepNumber });
+      if (this.dependencies.hookEngine) await this.applyHooks({ type: "step_start", run: { id: agentRunId, agent: this.dependencies.agentKind ?? "root" }, step: { number: stepNumber } });
       let step;
       try {
         const prepared = this.dependencies.continuity
@@ -246,6 +266,7 @@ export class AgentSession {
           return finish({ status: "model_stopped", reason: "empty_response", failedStep: stepNumber }, stepsCompleted);
         }
         await emit("step_finished", { step: stepNumber });
+        if (this.dependencies.hookEngine) await this.applyHooks({ type: "step_finish", run: { id: agentRunId, agent: this.dependencies.agentKind ?? "root" }, step: { number: stepNumber, outcome: "completed" } });
         if (taskMode === "plan") {
           const activePlanId = this.dependencies.idFactory?.() ?? crypto.randomUUID();
           this.activePlan = {
@@ -279,6 +300,12 @@ export class AgentSession {
         signal,
         usedToolCallIds,
         visibleToolNames: new Set(exposedTools.map(({ name }) => name)),
+        ...(this.dependencies.hookEngine === undefined ? {} : {
+          postAuthorizationGate: this.dependencies.hookEngine.toolGate(
+            { runId: agentRunId, agent: this.dependencies.agentKind ?? "root" },
+            (message) => this.pendingHookMessages.push(message)
+          ),
+        }),
         onEvent: (event) => emit("tool_event", {
           step: stepNumber,
           toolSequence: event.sequence,
@@ -302,15 +329,29 @@ export class AgentSession {
         })
       );
       this.dependencies.conversation.addToolResults(toolParts);
+      for (const message of this.pendingHookMessages.splice(0)) {
+        this.dependencies.conversation.addAutomationMessage("hook", message.hookId, message.content);
+      }
+      this.drainAutomationInbox();
       for (const item of persistedResults) {
         await emit("tool_result", {
           step: stepNumber,
           toolBatchId: batch.toolBatchId,
           ...item,
         });
+        if (this.dependencies.hookEngine) await this.applyHooks({
+          type: "tool_after",
+          run: { id: agentRunId, agent: this.dependencies.agentKind ?? "root" },
+          tool: {
+            name: item.toolName,
+            outcome: item.result.ok ? "succeeded" : "failed",
+            ...(item.result.ok ? {} : { error_code: item.result.error.code }),
+          },
+        });
       }
       stepsCompleted++;
       await emit("step_finished", { step: stepNumber });
+      if (this.dependencies.hookEngine) await this.applyHooks({ type: "step_finish", run: { id: agentRunId, agent: this.dependencies.agentKind ?? "root" }, step: { number: stepNumber } });
       if (signal.aborted) return finish({ status: "cancelled" }, stepsCompleted);
       const allUnknown = persistedResults.length > 0 && persistedResults.every(
         ({ result }) => !result.ok && result.error.code === "unknown_tool"
@@ -332,6 +373,20 @@ export class AgentSession {
       }
       if (consecutiveDenials >= 3) {
         stopReason = "permission_denial_loop";
+        break;
+      }
+      const hookDenial = hookDenialIdentity(persistedResults);
+      if (hookDenial === undefined) {
+        previousHookDenial = undefined;
+        consecutiveHookDenials = 0;
+      } else if (hookDenial === previousHookDenial) {
+        consecutiveHookDenials++;
+      } else {
+        previousHookDenial = hookDenial;
+        consecutiveHookDenials = 1;
+      }
+      if (consecutiveHookDenials >= 3) {
+        stopReason = "hook_denial_loop";
         break;
       }
     }
@@ -388,6 +443,22 @@ export class AgentSession {
     return (this.dependencies.clock?.() ?? new Date()).toISOString();
   }
 
+  private async applyHooks(event: HookEvent): Promise<HookResult> {
+    const result = await this.dependencies.hookEngine!.handle(event);
+    for (const message of result.messages) {
+      this.dependencies.conversation.addAutomationMessage("hook", message.hookId, message.content);
+    }
+    return result;
+  }
+
+  private readonly pendingHookMessages: Array<{ hookId: string; content: string }> = [];
+
+  private drainAutomationInbox(): void {
+    for (const message of this.dependencies.automationInbox?.drain() ?? []) {
+      this.dependencies.conversation.addAutomationMessage(message.origin, message.id, message.content);
+    }
+  }
+
   private nextModelCallNumber(reset = false): number {
     if (reset) this.modelCallNumber = 0;
     return ++this.modelCallNumber;
@@ -411,6 +482,9 @@ export class AgentSession {
         ? {}
         : { customInstructions: configured.customInstructions }),
       ...(configured?.skills === undefined ? {} : { skills: configured.skills }),
+      ...(this.dependencies.skillRun === undefined
+        ? {}
+        : { activeSkills: this.dependencies.skillRun.supplementalInstructions() }),
       ...(configured?.longTermMemory === undefined
         ? {}
         : { longTermMemory: configured.longTermMemory }),
@@ -426,8 +500,15 @@ function visibleTools(registry: ToolRegistry, mode: TaskMode) {
     : definitions.filter(({ name }) => ["read_file", "find_files", "search_text", "run_command"].includes(name));
 }
 
-function boundedFinalizationInstructions(reason: "step_limit_reached" | "unknown_tool_loop" | "permission_denial_loop"): string {
+function boundedFinalizationInstructions(reason: "step_limit_reached" | "unknown_tool_loop" | "permission_denial_loop" | "hook_denial_loop"): string {
   return `Do not use tools. The run stopped because ${reason}. State the stop reason, completed work, unfinished work, and recommended next step.`;
+}
+
+function hookDenialIdentity(results: readonly import("../tools/runner.js").ToolCallResult[]): string | undefined {
+  if (results.length !== 1) return undefined;
+  const result = results[0]?.result;
+  if (result?.ok !== false || result.error.code !== "hook_denied") return undefined;
+  return JSON.stringify(result.error.details ?? result.error.message);
 }
 
 function denialIdentity(results: readonly import("../tools/runner.js").ToolCallResult[]): string | undefined {

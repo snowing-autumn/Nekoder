@@ -7,6 +7,7 @@ import type {
   PermissionRuleSource,
   PermissionMode,
 } from "./types.js";
+import { compileCondition, type Condition } from "../extensions/condition-matcher.js";
 
 export interface SecurityPolicyOptions {
   readonly mode: PermissionMode;
@@ -170,10 +171,22 @@ function ruleMatches(
       ? commandGlobMatches(rule.match, target)
       : pathGlobMatches(rule.match, target);
   }
+  if (isCondition(rule.match)) {
+    return compileCondition(rule.match, { allowedFields: ["command", "path", "cwd", "tool"] })({
+      command: target,
+      path: target,
+      cwd,
+      tool: toolName,
+    });
+  }
   if (rule.match.command !== undefined && !commandGlobMatches(rule.match.command, target)) return false;
   if (rule.match.path !== undefined && !pathGlobMatches(rule.match.path, target)) return false;
   if (rule.match.cwd !== undefined && (cwd === undefined || !pathGlobMatches(rule.match.cwd, cwd))) return false;
   return true;
+}
+
+function isCondition(value: object): value is Condition {
+  return "field" in value || "not" in value || "all" in value || "any" in value;
 }
 
 function compareSpecificity(left: PermissionRule, right: PermissionRule): number {
@@ -195,7 +208,9 @@ function specificity(pattern: PermissionRule["match"]): {
 } {
   const patterns = typeof pattern === "string"
     ? [pattern]
-    : Object.values(pattern).filter((value): value is string => value !== undefined);
+    : isCondition(pattern)
+      ? []
+      : Object.values(pattern).filter((value): value is string => typeof value === "string");
   const wildcards = patterns.reduce(
     (total, value) => total + [...value].filter((character) => character === "*").length,
     0

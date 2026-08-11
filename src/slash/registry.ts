@@ -34,6 +34,8 @@ export interface SlashCommandContext {
     readonly scope?: "user" | "project";
     readonly type?: "preference" | "correction" | "project_knowledge" | "reference";
   }): SlashCommandResult | Promise<SlashCommandResult>;
+  skillInstall?(source: string, project: boolean): SlashCommandResult | Promise<SlashCommandResult>;
+  skillCreate?(name: string, description: string, project: boolean): SlashCommandResult | Promise<SlashCommandResult>;
 }
 
 export interface SlashCommand {
@@ -61,6 +63,7 @@ export class SlashRegistry {
   private readonly byCanonical = new Map<string, SlashCommand>();
   private readonly byToken = new Map<string, SlashCommand>();
   private sealed = false;
+  private dynamic: SlashCommand[] = [];
 
   register(command: SlashCommand): void {
     if (this.sealed) throw new Error("SlashRegistry is sealed");
@@ -91,12 +94,30 @@ export class SlashRegistry {
 
   resolve(token: string): SlashCommand | undefined {
     this.assertSealed();
-    return this.byToken.get(normalizeToken(token));
+    const candidates = this.candidates(token);
+    return candidates.length === 1 ? candidates[0] : undefined;
+  }
+
+  candidates(token: string): readonly SlashCommand[] {
+    this.assertSealed();
+    const normalized = normalizeToken(token);
+    return Object.freeze([
+      ...(this.byToken.get(normalized) ? [this.byToken.get(normalized)!] : []),
+      ...this.dynamic.filter((command) => [command.name, ...command.aliases].some((item) => normalizeToken(item) === normalized)),
+    ]);
+  }
+
+  replaceDynamic(commands: readonly SlashCommand[]): void {
+    this.assertSealed();
+    for (const command of commands) {
+      if (!COMMAND_NAME.test(command.name) || command.aliases.some((alias) => !ALIAS_NAME.test(alias))) throw new Error(`Invalid dynamic Slash command: ${command.name}`);
+    }
+    this.dynamic = [...commands];
   }
 
   commands(): SlashCommand[] {
     this.assertSealed();
-    return [...this.byCanonical.values()].sort((left, right) => left.name.localeCompare(right.name));
+    return [...this.byCanonical.values(), ...this.dynamic].sort((left, right) => left.name.localeCompare(right.name));
   }
 
   visibleCommands(): SlashCommand[] {
@@ -124,6 +145,7 @@ export type ParsedSlashInput =
   | { readonly kind: "blank" }
   | { readonly kind: "ordinary"; readonly text: string }
   | { readonly kind: "unknown"; readonly commandName: string }
+  | { readonly kind: "ambiguous"; readonly commandName: string; readonly candidates: readonly SlashCommand[]; readonly args: string }
   | {
       readonly kind: "command";
       readonly command: SlashCommand;
@@ -137,8 +159,10 @@ export function parseSlashInput(registry: SlashRegistry, rawText: string): Parse
   if (!trimmed.startsWith("/")) return { kind: "ordinary", text: rawText };
   const match = /^\/(\S+)(?:\s+([\s\S]*))?$/u.exec(trimmed);
   const invokedAs = match?.[1] ?? "";
-  const command = registry.resolve(invokedAs);
-  if (!command) return { kind: "unknown", commandName: invokedAs };
+  const candidates = registry.candidates(invokedAs);
+  if (candidates.length === 0) return { kind: "unknown", commandName: invokedAs };
+  if (candidates.length > 1) return { kind: "ambiguous", commandName: invokedAs, candidates, args: match?.[2] ?? "" };
+  const command = candidates[0]!;
   return {
     kind: "command",
     command,
