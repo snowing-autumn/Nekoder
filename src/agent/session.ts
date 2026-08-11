@@ -6,7 +6,8 @@ import {
   type PromptEnvironment,
 } from "../prompt/assembler.js";
 import type { ToolRegistry } from "../tools/registry.js";
-import type { ToolRunner } from "../tools/runner.js";
+import type { ToolCallResult, ToolRunner } from "../tools/runner.js";
+import type { ModelMessage } from "ai";
 import { AsyncQueue } from "./async-queue.js";
 import type { AgentEvent, AgentOutcome, AgentRunHandle, RunUsage, TaskMode } from "./types.js";
 
@@ -37,6 +38,15 @@ export interface AgentSessionDependencies {
   readonly idFactory?: () => string;
   readonly clock?: () => Date;
   readonly maxSteps?: number;
+  readonly continuity?: {
+    prepareModelCall(messages: readonly ModelMessage[]): Promise<{
+      readonly messages: readonly ModelMessage[];
+      readonly supplementalInstructions?: readonly string[];
+      readonly resetPromptCounter?: boolean;
+    }>;
+    prepareToolResults?(results: readonly ToolCallResult[]): Promise<readonly ToolCallResult[]>;
+    scheduleMemoryUpdate?(outcome: AgentOutcome): void | Promise<void>;
+  };
   readonly promptContext?: {
     readonly permissionMode: "strict" | "plan" | "default" | "acceptEdit" | "permissive";
     readonly environment: PromptEnvironment;
@@ -54,6 +64,7 @@ export class AgentSession {
     | { readonly id: string; readonly originalGoal: string; readonly text: string; readonly createdAt: string }
     | undefined;
   private pendingUserGoal = "";
+  private modelCallNumber = 0;
 
   constructor(private readonly dependencies: AgentSessionDependencies) {
     this.permissionMode = dependencies.promptContext?.permissionMode ?? "default";
@@ -90,6 +101,7 @@ export class AgentSession {
 
   private start(taskMode: TaskMode): AgentRunHandle {
     this.active = true;
+    this.modelCallNumber = 0;
     const agentRunId = this.dependencies.idFactory?.() ?? crypto.randomUUID();
     const controller = new AbortController();
     let completion: Promise<unknown> | undefined;
@@ -169,10 +181,16 @@ export class AgentSession {
       await emit("step_started", { step: stepNumber });
       let step;
       try {
+        const prepared = this.dependencies.continuity
+          ? await this.dependencies.continuity.prepareModelCall(this.dependencies.conversation.getMessages())
+          : { messages: this.dependencies.conversation.getMessages() };
         step = await this.dependencies.model.collect({
-          messages: this.dependencies.conversation.getMessages(),
+          messages: prepared.messages,
           tools: exposedTools,
-          systemInstructions: this.systemInstructions(taskMode, stepNumber),
+          systemInstructions: [
+            ...this.systemInstructions(taskMode, this.nextModelCallNumber(prepared.resetPromptCounter)),
+            ...(prepared.supplementalInstructions ?? []),
+          ],
           toolChoice: "auto",
           signal,
           onTextDelta: (delta) => emit("text_delta", { step: stepNumber, delta }),
@@ -236,9 +254,13 @@ export class AgentSession {
             text: step.text,
             createdAt: this.now(),
           };
-          return finish({ status: "completed", finalText: step.text, activePlanId }, stepsCompleted);
+          const outcome = finish({ status: "completed", finalText: step.text, activePlanId }, stepsCompleted);
+          await this.dependencies.continuity?.scheduleMemoryUpdate?.(outcome);
+          return outcome;
         }
-        return finish({ status: "completed", finalText: step.text }, stepsCompleted);
+        const outcome = finish({ status: "completed", finalText: step.text }, stepsCompleted);
+        await this.dependencies.continuity?.scheduleMemoryUpdate?.(outcome);
+        return outcome;
       }
       if (step.finishReason === "tool-calls" && step.toolCalls.length === 0) {
         return finish({ status: "model_stopped", reason: "protocol_error", failedStep: stepNumber }, stepsCompleted);
@@ -268,7 +290,10 @@ export class AgentSession {
         ),
       });
       for (const call of step.toolCalls) usedToolCallIds.add(call.toolCallId);
-      const toolParts = batch.results.map(
+      const persistedResults = this.dependencies.continuity?.prepareToolResults
+        ? await this.dependencies.continuity.prepareToolResults(batch.results)
+        : batch.results;
+      const toolParts = persistedResults.map(
         ({ toolCallId, toolName, result }): ToolResultPart => ({
           type: "tool-result",
           toolCallId,
@@ -277,7 +302,7 @@ export class AgentSession {
         })
       );
       this.dependencies.conversation.addToolResults(toolParts);
-      for (const item of batch.results) {
+      for (const item of persistedResults) {
         await emit("tool_result", {
           step: stepNumber,
           toolBatchId: batch.toolBatchId,
@@ -287,7 +312,7 @@ export class AgentSession {
       stepsCompleted++;
       await emit("step_finished", { step: stepNumber });
       if (signal.aborted) return finish({ status: "cancelled" }, stepsCompleted);
-      const allUnknown = batch.results.length > 0 && batch.results.every(
+      const allUnknown = persistedResults.length > 0 && persistedResults.every(
         ({ result }) => !result.ok && result.error.code === "unknown_tool"
       );
       consecutiveUnknownBatches = allUnknown ? consecutiveUnknownBatches + 1 : 0;
@@ -295,7 +320,7 @@ export class AgentSession {
         stopReason = "unknown_tool_loop";
         break;
       }
-      const denial = denialIdentity(batch.results);
+      const denial = denialIdentity(persistedResults);
       if (denial === undefined) {
         previousDenial = undefined;
         consecutiveDenials = 0;
@@ -313,14 +338,20 @@ export class AgentSession {
     stopReason ??= "step_limit_reached";
     let finalization;
     try {
+      const prepared = this.dependencies.continuity
+        ? await this.dependencies.continuity.prepareModelCall(this.dependencies.conversation.getMessages())
+        : { messages: this.dependencies.conversation.getMessages() };
       finalization = await this.dependencies.model.collect({
-        messages: this.dependencies.conversation.getMessages(),
+        messages: prepared.messages,
         tools: [],
-        systemInstructions: this.systemInstructions(
-          taskMode,
-          stepsCompleted + 1,
-          boundedFinalizationInstructions(stopReason)
-        ),
+        systemInstructions: [
+          ...this.systemInstructions(
+            taskMode,
+            this.nextModelCallNumber(prepared.resetPromptCounter),
+            boundedFinalizationInstructions(stopReason)
+          ),
+          ...(prepared.supplementalInstructions ?? []),
+        ],
         toolChoice: "none",
         signal,
         onTextDelta: (delta) => emit("text_delta", { finalization: true, delta }),
@@ -355,6 +386,11 @@ export class AgentSession {
 
   private now(): string {
     return (this.dependencies.clock?.() ?? new Date()).toISOString();
+  }
+
+  private nextModelCallNumber(reset = false): number {
+    if (reset) this.modelCallNumber = 0;
+    return ++this.modelCallNumber;
   }
 
   private systemInstructions(

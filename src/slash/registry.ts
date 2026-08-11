@@ -8,7 +8,7 @@ export type SlashCommandResult =
   | { readonly kind: "run_started"; readonly agentRunId: string; readonly displayText: string }
   | {
       readonly kind: "blocked";
-      readonly code: "run_active" | "no_active_plan" | "unavailable";
+      readonly code: "run_active" | "no_active_plan" | "unavailable" | "not_found" | "operation_failed";
       readonly message: string;
     };
 
@@ -18,10 +18,22 @@ export interface SlashCommandContext {
   executeActivePlan(): SlashCommandResult | Promise<SlashCommandResult>;
   startPrompt(modelText: string, displayText: string): SlashCommandResult | Promise<SlashCommandResult>;
   clearTranscript(): void;
-  status(): string;
+  status(): string | Promise<string>;
   permission(): { readonly base: string; readonly effective: string; readonly sources: readonly string[] };
   setPermission(mode: "strict" | "plan" | "default" | "acceptEdit" | "permissive"): void;
   confirmPermissive(): SlashCommandResult | Promise<SlashCommandResult>;
+  compact?(): SlashCommandResult | Promise<SlashCommandResult>;
+  clearSession?(): SlashCommandResult | Promise<SlashCommandResult>;
+  session?(action: {
+    readonly kind: "current" | "list" | "resume" | "new" | "delete";
+    readonly sessionId?: string;
+  }): SlashCommandResult | Promise<SlashCommandResult>;
+  memory?(action: {
+    readonly kind: "status" | "list" | "show" | "forget";
+    readonly memoryId?: string;
+    readonly scope?: "user" | "project";
+    readonly type?: "preference" | "correction" | "project_knowledge" | "reference";
+  }): SlashCommandResult | Promise<SlashCommandResult>;
 }
 
 export interface SlashCommand {

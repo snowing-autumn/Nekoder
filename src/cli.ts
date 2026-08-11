@@ -1,4 +1,5 @@
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline/promises";
 
 import { AgentSession } from "./agent/session.js";
@@ -20,6 +21,15 @@ import { createDemoApplication } from "./tui/demo.js";
 import { SessionController } from "./tui/session-controller.js";
 import { startTui } from "./tui/start.js";
 import { sanitizeTerminalText } from "./tui/terminal-text.js";
+import { ContextCompactor } from "./continuity/context-compactor.js";
+import { InstructionLoader } from "./continuity/instruction-loader.js";
+import { MemoryCatalog } from "./continuity/memory-catalog.js";
+import { MemoryJobRunner } from "./continuity/memory-job-runner.js";
+import { CatalogMemoryOperationWriter, ModelMemoryJobProcessor } from "./continuity/memory-model-adapters.js";
+import { SessionJournal } from "./continuity/session-journal.js";
+import { TokenCounter } from "./continuity/token-counter.js";
+import { ToolArtifactStore } from "./continuity/tool-artifact-store.js";
+import { WorkspaceRuntime } from "./continuity/workspace-runtime.js";
 
 export interface CliOptions {
   readonly demo: boolean;
@@ -81,6 +91,7 @@ export async function runCli(
     readonly permissionSources?: readonly string[];
     readonly mcpDiagnostics?: () => ReturnType<McpManager["diagnostics"]>;
     readonly initialMessages?: readonly string[];
+    readonly runtime?: WorkspaceRuntime;
     dispose(): Promise<void>;
   };
   try {
@@ -108,6 +119,7 @@ export async function runCli(
     permissionSources: configured.permissionSources,
     mcpDiagnostics: configured.mcpDiagnostics,
     initialMessages: configured.initialMessages,
+    runtime: configured.runtime,
   });
   const stop = (): void => { void app.stop(); };
   process.once("SIGINT", stop);
@@ -131,6 +143,7 @@ async function createConfiguredApplication(
   readonly permissionSources: readonly string[];
   readonly mcpDiagnostics: () => ReturnType<McpManager["diagnostics"]>;
   readonly initialMessages: readonly string[];
+  readonly runtime: WorkspaceRuntime;
   dispose(): Promise<void>;
 }> {
   const config = loadConfig(workspace);
@@ -188,12 +201,46 @@ async function createConfiguredApplication(
     approvalHandler: approvalBroker,
     persistentRuleWriter: new PermissionRuleFileStore(workspace),
     maxParallelReads: config.tools.max_parallel_reads,
+    deferOutputBudget: true,
   });
+  const conversation = new ConversationManager();
+  const journal = new SessionJournal({ root: join(workspace, ".nekoder", "sessions") });
+  const memory = await MemoryCatalog.open({ workspace, homeDir: homedir() });
+  const memoryJobs = await MemoryJobRunner.open({
+    workspace,
+    homeDir: homedir(),
+    processor: new ModelMemoryJobProcessor(model),
+    writer: new CatalogMemoryOperationWriter(workspace, homedir(), memory),
+  });
+  const instructions = new InstructionLoader({ workspace, homeDir: homedir() });
+  const artifacts = new ToolArtifactStore(workspace);
+  const counter = new TokenCounter({ contextWindow: limits.contextWindow });
+  const compactor = new ContextCompactor({
+    conversation,
+    model,
+    counter,
+    tools: () => registry.definitions(),
+    onCompacted: async (result) => {
+      const current = await journal.current();
+      if (!current) return;
+      const lastSeq = Math.max(...current.events.map(({ seq }) => seq));
+      await journal.append({
+        type: "compacted",
+        coveredThroughSeq: lastSeq,
+        retainedFromSeq: Math.max(1, lastSeq - result.preservedUnits * 2),
+        summary: result.summary,
+        interactionCount: result.interactionCount,
+        beforeTokens: result.before.requiredTokens,
+        afterTokens: result.after.requiredTokens,
+      });
+    },
+  });
+  let runtime!: WorkspaceRuntime;
   const session = new AgentSession({
     model,
     registry,
     toolRunner: runner,
-    conversation: new ConversationManager(),
+    conversation,
     workspace,
     maxSteps: config.agent.max_steps,
     promptContext: {
@@ -204,6 +251,11 @@ async function createConfiguredApplication(
       environment: environment(),
       environmentProvider: environment,
     },
+    continuity: {
+      prepareModelCall: (messages) => runtime.continuityHooks().prepareModelCall(messages),
+      prepareToolResults: (results) => runtime.continuityHooks().prepareToolResults!(results),
+      scheduleMemoryUpdate: (outcome) => runtime.continuityHooks().scheduleMemoryUpdate?.(outcome),
+    },
   });
   const controller = new SessionController(
     session,
@@ -211,11 +263,23 @@ async function createConfiguredApplication(
     security.config.mode,
     (mode) => security.policy.setMode(mode)
   );
+  runtime = new WorkspaceRuntime({
+    controller,
+    conversation,
+    journal,
+    memory,
+    instructions,
+    compactor,
+    artifacts,
+    memoryJobs,
+  });
+  await runtime.initialize();
   const mcpDiagnostics = mcpManager.diagnostics();
   const connectedMcp = mcpDiagnostics.filter(({ status }) => status === "connected").length;
   const unavailableMcp = mcpDiagnostics.length - connectedMcp;
   return {
     controller,
+    runtime,
     toolNames: registry.definitions().map(({ name }) => name),
     permissionSources: Object.entries(security.config.rules)
       .filter(([, rules]) => rules.length > 0)

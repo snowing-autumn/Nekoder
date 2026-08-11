@@ -5,7 +5,7 @@ import {
   type SlashRegistry,
 } from "./registry.js";
 
-export class SlashDispatcher {
+export class UserInputRouter {
   constructor(
     readonly registry: SlashRegistry,
     private readonly context: () => SlashCommandContext

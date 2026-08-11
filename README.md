@@ -39,7 +39,9 @@ Demo 不需要 API Key，并且仍经过真实的 `AgentSession → SessionContr
 
 鼠标采用 SGR 1006，支持滚轮、工具卡点击和审批点击；所有鼠标动作均有键盘等价路径。
 
-内置 Slash 命令包括 `/help`、`/cls`、`/plan`、`/do`、`/permission`、`/status` 和 `/review`。`/compact`、`/memory`、`/clear`、`/session` 已保留稳定入口，但在上下文压缩、记忆和持久会话实现前会明确报告不可用。
+内置 Slash 命令包括 `/help`、`/compact`、`/clear`、`/cls`、`/plan`、`/do`、`/session`、`/memory`、`/permission`、`/status` 和 `/review`。上下文压缩、Markdown Memory Note 与项目本地 JSONL Session 均通过本地 Slash 动作管理，不会把命令文本转交 Agent。
+
+Session、上下文压缩、Project Instructions、Memory Notes、Tool Artifacts 与后台记忆作业的完整设计见 [`docs/continuity-system.md`](./docs/continuity-system.md)；可执行需求规格见 [`.scratch/continuity/spec.md`](./.scratch/continuity/spec.md)。
 
 MCP 配置使用 `mcp_servers` map，支持 `transport: stdio` 的 `command`/`args`/`env`，以及 `transport: http` 的 `url`/`headers`。`${VAR}` 只在显式 `env` 与 `headers` 值中展开；远程 URL 默认必须使用 HTTPS，loopback 地址可使用 HTTP。完整契约见 `goal.md` 的 MCP 章节。
 

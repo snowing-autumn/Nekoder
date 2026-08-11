@@ -74,20 +74,6 @@ export class SessionController {
     return () => this.eventListeners.delete(listener);
   }
 
-  submit(rawText: string): ControllerResult {
-    const command = rawText.trim();
-    if (!command) {
-      return { ok: false, code: "blank_input", message: "User input must not be blank" };
-    }
-    if (command === "/plan") {
-      return this.enterPlanMode();
-    }
-    if (command === "/do") {
-      return this.executeActivePlan();
-    }
-    return this.startUserRun(rawText);
-  }
-
   enterPlanMode(): ControllerResult {
     if (this.activeHandle) return runActiveResult();
     this.setSnapshot({ ...this.snapshot, taskMode: "plan" });

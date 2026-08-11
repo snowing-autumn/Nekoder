@@ -48,8 +48,22 @@ export function createBuiltinSlashRegistry(): SlashRegistry {
         };
       },
     },
-    unavailable("compact", "Compact the current context", "/compact"),
-    unavailable("clear", "Close this Session and start a clean Session", "/clear"),
+    {
+      name: "compact", aliases: [], description: "Compact the current context", usage: "/compact",
+      destination: "local", allowDuringRun: false,
+      async handle(context, args) {
+        if (args) return usage("/compact does not accept arguments", "/compact");
+        return context.compact ? await context.compact() : unavailableResult("compact");
+      },
+    },
+    {
+      name: "clear", aliases: [], description: "Close this Session and start a clean Session", usage: "/clear",
+      destination: "local", allowDuringRun: false,
+      async handle(context, args) {
+        if (args) return usage("/clear does not accept arguments", "/clear");
+        return context.clearSession ? await context.clearSession() : unavailableResult("clear");
+      },
+    },
     {
       name: "cls", aliases: [], description: "Clear the visible timeline only", usage: "/cls",
       destination: "local", allowDuringRun: false,
@@ -75,8 +89,58 @@ export function createBuiltinSlashRegistry(): SlashRegistry {
         return await context.executeActivePlan();
       },
     },
-    unavailable("session", "Manage persistent Sessions", "/session [list|resume <id>|new|delete <id>]", "action"),
-    unavailable("memory", "Inspect or manage memory", "/memory"),
+    {
+      name: "session", aliases: [], description: "Manage persistent Sessions",
+      usage: "/session [list|resume <id>|new|delete <id>]", argumentHint: "action",
+      destination: "local", allowDuringRun: false,
+      async handle(context, args) {
+        if (!context.session) return unavailableResult("session");
+        const parts = words(args);
+        if (parts.length === 0) return await context.session({ kind: "current" });
+        if (parts.length === 1 && parts[0] === "list") return await context.session({ kind: "list" });
+        if (parts.length === 1 && parts[0] === "new") return await context.session({ kind: "new" });
+        if (parts.length === 2 && parts[0] === "resume") {
+          return await context.session({ kind: "resume", sessionId: parts[1] });
+        }
+        if (parts.length === 2 && parts[0] === "delete") {
+          return await context.session({ kind: "delete", sessionId: parts[1] });
+        }
+        return usage("Invalid /session arguments", "/session [list|resume <id>|new|delete <id>]");
+      },
+    },
+    {
+      name: "memory", aliases: [], description: "Inspect persistent Memory Notes",
+      usage: "/memory [list [scope] [type]|show <id>|forget <id>]", argumentHint: "action",
+      destination: "local", allowDuringRun: true,
+      async handle(context, args) {
+        if (!context.memory) return unavailableResult("memory");
+        const parts = words(args);
+        if (parts.length === 0) return await context.memory({ kind: "status" });
+        if (parts[0] === "show" && parts.length === 2) {
+          return await context.memory({ kind: "show", memoryId: parts[1] });
+        }
+        if (parts[0] === "forget" && parts.length === 2) {
+          if (context.runActive) return runActiveResult();
+          return await context.memory({ kind: "forget", memoryId: parts[1] });
+        }
+        if (parts[0] === "list" && parts.length <= 3) {
+          const scope = parts[1];
+          const type = parts[2];
+          if (scope !== undefined && scope !== "user" && scope !== "project") {
+            return usage("Invalid Memory scope", "/memory list [user|project] [preference|correction|project_knowledge|reference]");
+          }
+          if (type !== undefined && !["preference", "correction", "project_knowledge", "reference"].includes(type)) {
+            return usage("Invalid Memory type", "/memory list [user|project] [preference|correction|project_knowledge|reference]");
+          }
+          return await context.memory({
+            kind: "list",
+            ...(scope === undefined ? {} : { scope }),
+            ...(type === undefined ? {} : { type: type as "preference" | "correction" | "project_knowledge" | "reference" }),
+          });
+        }
+        return usage("Invalid /memory arguments", "/memory [list [scope] [type]|show <id>|forget <id>]");
+      },
+    },
     {
       name: "permission", aliases: ["perm"], description: "Show or change the session Permission Mode",
       usage: "/permission [strict|plan|default|accept-edit|permissive]", argumentHint: "mode",
@@ -108,7 +172,7 @@ export function createBuiltinSlashRegistry(): SlashRegistry {
       destination: "local", allowDuringRun: true,
       async handle(context, args) {
         if (args) return usage("/status does not accept arguments", "/status");
-        return { kind: "info", message: context.status() };
+        return { kind: "info", message: await context.status() };
       },
     },
     {
@@ -127,29 +191,20 @@ export function createBuiltinSlashRegistry(): SlashRegistry {
   return registry;
 }
 
-function unavailable(
-  name: string,
-  description: string,
-  commandUsage: string,
-  argumentHint?: string
-): SlashCommand {
+function unavailableResult(name: string): SlashCommandResult {
   return {
-    name,
-    aliases: [],
-    description,
-    usage: commandUsage,
-    ...(argumentHint === undefined ? {} : { argumentHint }),
-    destination: "local",
-    available: false,
-    allowDuringRun: false,
-    async handle() {
-      return {
-        kind: "blocked",
-        code: "unavailable",
-        message: `/${name} is not available in this version`,
-      };
-    },
+    kind: "blocked",
+    code: "unavailable",
+    message: `/${name} is not available in this runtime`,
   };
+}
+
+function runActiveResult(): SlashCommandResult {
+  return { kind: "blocked", code: "run_active", message: "An agent run is already active" };
+}
+
+function words(args: string): string[] {
+  return args.trim() ? args.trim().split(/\s+/u) : [];
 }
 
 function availability(command: SlashCommand, context: SlashCommandContext): string {

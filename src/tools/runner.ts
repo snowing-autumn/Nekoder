@@ -69,6 +69,8 @@ export interface ToolRunnerOptions {
   readonly persistentRuleWriter?: PersistentRuleWriter;
   readonly eventSink?: ToolEventSink;
   readonly maxParallelReads?: number;
+  /** Defer model-facing output budgeting to the continuity layer so it can persist Tool Artifacts first. */
+  readonly deferOutputBudget?: boolean;
 }
 
 export interface ToolCallResult {
@@ -475,7 +477,7 @@ export class ToolRunner {
         clearTimeout(timeout);
         context.signal?.removeEventListener("abort", onParentAbort);
         const encoded = Buffer.from(JSON.stringify(result), "utf8");
-        if (encoded.byteLength > 64 * 1024) {
+        if (!this.options.deferOutputBudget && encoded.byteLength > 64 * 1024) {
           result = {
             ok: false,
             error: {
@@ -562,7 +564,7 @@ export class ToolRunner {
     await emit(context.signal?.aborted ? "batch_cancelled" : "batch_finished");
     return {
       toolBatchId: context.toolBatchId,
-      results: applyBatchOutputBudget(results),
+      results: this.options.deferOutputBudget ? results : applyBatchOutputBudget(results),
     };
   }
 }

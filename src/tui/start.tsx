@@ -14,8 +14,14 @@ import type { TaskMode } from "../agent/types.js";
 import type { ApprovalDecision, PermissionMode } from "../security/types.js";
 import type { McpDiagnostic } from "../mcp/manager.js";
 import { createBuiltinSlashRegistry } from "../slash/builtins.js";
-import { SlashDispatcher } from "../slash/dispatcher.js";
+import { UserInputRouter } from "../slash/dispatcher.js";
 import type { SlashCommand, SlashCommandResult } from "../slash/registry.js";
+import type {
+  RuntimeCommand,
+  RuntimeCommandResult,
+  RuntimeQueryResult,
+  WorkspaceRuntime,
+} from "../continuity/workspace-runtime.js";
 import {
   applyComposerAction,
   createComposerBuffer,
@@ -24,7 +30,7 @@ import {
 import type { ControllerResult, SessionController, SessionSnapshot } from "./session-controller.js";
 import { parseSgrMouse } from "./mouse-input.js";
 import { parseSafeMarkdown } from "./markdown.js";
-import { createTuiState, reduceTuiAction, type TranscriptItem } from "./store.js";
+import { createTuiState, reduceTuiAction, type TranscriptItem, type TuiAction } from "./store.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 import { runStateColor, toolColor, TUI_COLORS } from "./theme.js";
 
@@ -43,6 +49,7 @@ export interface StartTuiOptions {
   readonly permissionSources?: readonly string[];
   readonly mcpDiagnostics?: () => readonly McpDiagnostic[];
   readonly initialMessages?: readonly string[];
+  readonly runtime?: WorkspaceRuntime;
 }
 
 export interface TuiApplication {
@@ -280,6 +287,7 @@ function Shell({
   permissionSources = [],
   mcpDiagnostics,
   initialMessages = [],
+  runtime,
   onInputReady,
   onRequestExit,
 }: ShellProps) {
@@ -309,7 +317,7 @@ function Shell({
     controller?.getSnapshot() ?? { taskMode, permissionMode: "default", runStatus: "idle" }
   );
   const [userConfirmation, setUserConfirmation] = useState<string>();
-  const [localConfirmation, setLocalConfirmation] = useState<string>();
+  const [localConfirmation, setLocalConfirmation] = useState<{ readonly id: string; readonly message: string }>();
   const [completion, setCompletion] = useState<{ readonly commands: readonly SlashCommand[]; readonly index: number }>();
   const initialMessagesPublished = useRef(false);
   useEffect(() => {
@@ -361,12 +369,28 @@ function Shell({
     if (localConfirmation) {
       const answer = input.toLowerCase();
       if (answer === "y") {
-        controller?.setPermissionMode("permissive");
+        if (localConfirmation.id === "permission-permissive") {
+          controller?.setPermissionMode("permissive");
+          dispatch({ type: "local_message", level: "success", message: "Permission Mode changed to permissive for this session" });
+        } else if (runtime) {
+          void runtime.execute({
+            kind: "confirmation.resolve",
+            confirmationId: localConfirmation.id,
+            accepted: true,
+          }).then((result) => publishRuntimeResult(result, dispatch));
+        }
         setLocalConfirmation(undefined);
-        dispatch({ type: "local_message", level: "success", message: "Permission Mode changed to permissive for this session" });
       } else if (answer === "n" || key.escape) {
+        if (localConfirmation.id !== "permission-permissive" && runtime) {
+          void runtime.execute({
+            kind: "confirmation.resolve",
+            confirmationId: localConfirmation.id,
+            accepted: false,
+          }).then((result) => publishRuntimeResult(result, dispatch));
+        } else {
+          dispatch({ type: "local_message", level: "info", message: "Permission Mode was not changed" });
+        }
         setLocalConfirmation(undefined);
-        dispatch({ type: "local_message", level: "info", message: "Permission Mode was not changed" });
       }
       return;
     }
@@ -450,20 +474,31 @@ function Shell({
       const text = composerRef.current.text;
       if (!text.trim() || !controller) return;
       setCompletion(undefined);
-      const slash = new SlashDispatcher(BUILTIN_SLASH_REGISTRY, () => ({
+      const slash = new UserInputRouter(BUILTIN_SLASH_REGISTRY, () => ({
         runActive: controller.getSnapshot().runStatus === "running",
         enterPlanMode: () => controllerResult(controller.enterPlanMode(), "/plan"),
-        executeActivePlan: () => controllerResult(controller.executeActivePlan(), "/do"),
-        startPrompt: (modelText, displayText) => controllerResult(controller.startUserRun(modelText), displayText),
+        executeActivePlan: async () => runtime
+          ? runtimeCommandToSlash(await runtime.execute({ kind: "plan.execute" }), setLocalConfirmation, dispatch, "/do")
+          : controllerResult(controller.executeActivePlan(), "/do"),
+        startPrompt: async (modelText, displayText) => controllerResult(
+          runtime
+            ? await runtime.startRun({ modelText, displayText })
+            : controller.startUserRun(modelText),
+          displayText
+        ),
         clearTranscript: () => dispatch({ type: "clear_transcript" }),
-        status: () => formatStatus({
-          workspace,
-          session: controller.getSnapshot(),
-          state,
-          toolNames,
-          permissionSources,
-          diagnostics: mcpDiagnostics?.() ?? [],
-        }),
+        status: async () => {
+          const base = formatStatus({
+            workspace,
+            session: controller.getSnapshot(),
+            state,
+            toolNames,
+            permissionSources,
+            diagnostics: mcpDiagnostics?.() ?? [],
+          });
+          if (!runtime) return `${base}\nContinuity: unavailable`;
+          return `${base}\n${formatRuntimeQuery(await runtime.inspect({ kind: "runtime.status" }))}`;
+        },
         permission: () => {
           const snapshot = controller.getSnapshot();
           return {
@@ -475,12 +510,66 @@ function Shell({
         setPermission: (mode) => { controller.setPermissionMode(mode); },
         confirmPermissive: () => {
           const confirmationId = "permission-permissive";
-          setLocalConfirmation(confirmationId);
+          setLocalConfirmation({
+            id: confirmationId,
+            message: "Permissive Mode allows most operations without approval. Nekoder has no OS sandbox.",
+          });
           return {
             kind: "confirmation_required",
             confirmationId,
             message: "Permissive Mode allows most operations without approval. Nekoder has no OS sandbox. [Y] Confirm  [N] Cancel",
           };
+        },
+        compact: async () => runtimeCommandToSlash(
+          runtime ? await runtime.execute({ kind: "context.compact" }) : runtimeUnavailable(),
+          setLocalConfirmation,
+          dispatch
+        ),
+        clearSession: async () => runtimeCommandToSlash(
+          runtime ? await runtime.execute({ kind: "session.new" }) : runtimeUnavailable(),
+          setLocalConfirmation,
+          dispatch
+        ),
+        session: async (action) => {
+          if (!runtime) return runtimeCommandToSlash(runtimeUnavailable(), setLocalConfirmation, dispatch);
+          if (action.kind === "current") {
+            return { kind: "info", message: formatRuntimeQuery(await runtime.inspect({ kind: "session.current" })) };
+          }
+          if (action.kind === "list") {
+            return { kind: "info", message: formatRuntimeQuery(await runtime.inspect({ kind: "session.list", limit: 20 })) };
+          }
+          const command: RuntimeCommand = action.kind === "new"
+            ? { kind: "session.new" }
+            : action.kind === "resume"
+              ? { kind: "session.resume", sessionId: action.sessionId! }
+              : { kind: "session.delete", sessionId: action.sessionId! };
+          return runtimeCommandToSlash(await runtime.execute(command), setLocalConfirmation, dispatch);
+        },
+        memory: async (action) => {
+          if (!runtime) return runtimeCommandToSlash(runtimeUnavailable(), setLocalConfirmation, dispatch);
+          if (action.kind === "status") {
+            return { kind: "info", message: formatRuntimeQuery(await runtime.inspect({ kind: "memory.status" })) };
+          }
+          if (action.kind === "list") {
+            return { kind: "info", message: formatRuntimeQuery(await runtime.inspect({
+              kind: "memory.list",
+              ...(action.scope === undefined ? {} : { scope: action.scope }),
+              ...(action.type === undefined ? {} : { type: action.type }),
+              limit: 20,
+            })) };
+          }
+          if (action.kind === "show") {
+            try {
+              return { kind: "info", message: formatRuntimeQuery(await runtime.inspect({ kind: "memory.show", memoryId: action.memoryId! })) };
+            } catch (error) {
+              return { kind: "blocked", code: "not_found", message: (error instanceof Error ? error.message : String(error)).slice(0, 500) };
+            }
+          }
+          return runtimeCommandToSlash(
+            await runtime.execute({ kind: "memory.forget", memoryId: action.memoryId! }),
+            setLocalConfirmation,
+            dispatch
+          );
         },
       }));
       void slash.submit(text).then((result) => {
@@ -580,7 +669,7 @@ function Shell({
           {localConfirmation && (
             <Box flexDirection="column" borderStyle="round" borderColor={TUI_COLORS.approval} paddingX={1}>
               <Text bold>Local confirmation required</Text>
-              <Text>Permissive Mode allows most operations without approval. Nekoder has no OS sandbox.</Text>
+               <Text>{localConfirmation.message}</Text>
               <Text>[Y] Confirm  [N] Cancel</Text>
             </Box>
           )}
@@ -722,7 +811,7 @@ function formatStatus(options: {
         `${item.server}: ${item.status}, tools ${item.registeredTools}/${item.discoveredTools}${item.restartRequired ? ", restart required" : ""}`
       ).join("\n  ");
   return [
-    `Task Mode: ${options.session.taskMode.toUpperCase()}`,
+    `Task Mode: [${options.session.taskMode.toUpperCase()}]`,
     `Base Permission: ${options.session.permissionMode}`,
     `Effective Permission: ${effectivePermission(options.session.permissionMode, options.session.taskMode)}`,
     `Permission sources: ${options.permissionSources.join(", ") || "none"}`,
@@ -734,8 +823,76 @@ function formatStatus(options: {
     `Enabled Tools: ${visible.join(", ") || "none"}`,
     `Hidden Tools: ${hidden}`,
     `MCP:\n  ${mcp}`,
-    "Memory: not implemented",
   ].join("\n");
+}
+
+function runtimeUnavailable(): RuntimeCommandResult {
+  return { kind: "blocked", code: "operation_failed", message: "Continuity runtime is unavailable" };
+}
+
+function runtimeCommandToSlash(
+  result: RuntimeCommandResult,
+  setConfirmation: (value: { readonly id: string; readonly message: string } | undefined) => void,
+  dispatch: (action: TuiAction) => void,
+  displayText = ""
+): SlashCommandResult {
+  if (result.kind === "run_started") return { kind: "run_started", agentRunId: result.agentRunId, displayText };
+  if (result.kind === "success") {
+    if (result.clearTimeline) dispatch({ type: "clear_transcript" });
+    return { kind: "success", message: result.message, clearTranscript: result.clearTimeline };
+  }
+  if (result.kind === "info") return result;
+  if (result.kind === "confirmation_required") {
+    setConfirmation({ id: result.confirmationId, message: result.message });
+    return result;
+  }
+  return { kind: "blocked", code: result.code, message: result.message };
+}
+
+function publishRuntimeResult(result: RuntimeCommandResult, dispatch: (action: TuiAction) => void): void {
+  if (result.kind === "run_started") return;
+  if (result.kind === "success") {
+    if (result.clearTimeline) dispatch({ type: "clear_transcript" });
+    dispatch({ type: "local_message", level: "success", message: result.message });
+  } else if (result.kind === "info") {
+    dispatch({ type: "local_message", level: "info", message: result.message });
+  } else if (result.kind === "blocked") {
+    dispatch({ type: "local_message", level: "error", message: result.message });
+  }
+}
+
+function formatRuntimeQuery(result: RuntimeQueryResult): string {
+  if (result.kind === "runtime.status") {
+    const { session, compaction, memory, memoryJobs } = result.value;
+    const accuracy = compaction.accuracy === "estimated" ? "estimated" : "exact";
+    return [
+      `Session: ${session.id} · ${session.messageCount} messages`,
+      `Context: ${compaction.accuracy === "estimated" ? "~" : ""}${compaction.currentTokens.toLocaleString("en-US")} / ${compaction.contextWindow.toLocaleString("en-US")} tokens · ${accuracy}`,
+      `Compaction: ${compaction.circuitOpen ? "circuit open" : "ready"} · auto at ${compaction.autoThreshold.toLocaleString("en-US")} · failures ${compaction.failures}`,
+      `Memory: ${memory.user} user + ${memory.project} project loaded`,
+      `Memory health: ${memory.conflicts} conflict · ${memory.reviewDue} review due · ${memory.invalid} invalid`,
+      ...(memoryJobs ? [`Memory jobs: ${memoryJobs.update.pending + memoryJobs.update.running} update pending/running · ${memoryJobs.update.failed} failed; ${memoryJobs.organize.pending + memoryJobs.organize.running} organize pending/running · ${memoryJobs.organize.failed} failed`] : []),
+    ].join("\n");
+  }
+  if (result.kind === "session.current") {
+    const item = result.value;
+    return `${item.id}\nTitle: ${item.title || "untitled"}\nMessages: ${item.messageCount}\nUpdated: ${item.updatedAt}`;
+  }
+  if (result.kind === "session.list") {
+    return result.value.length === 0
+      ? "No Sessions"
+      : result.value.map((item) => `${item.id} · ${item.messageCount} messages · ${item.title || "untitled"} · ${item.updatedAt}`).join("\n");
+  }
+  if (result.kind === "memory.status") {
+    const item = result.value;
+    return `Memory: ${item.loaded} loaded (${item.user} user, ${item.project} project)\nInjectable: ${item.injectable}\nConflicts: ${item.conflicts}\nReview due: ${item.reviewDue}\nInvalid: ${item.invalid}`;
+  }
+  if (result.kind === "memory.list") {
+    return result.value.length === 0
+      ? "No Memory Notes"
+      : result.value.map((item) => `${item.id} · ${item.scope}/${item.type} · ${item.status}${item.conflict ? " · conflict" : ""}${item.reviewDue ? " · review due" : ""}\n  ${item.title}`).join("\n");
+  }
+  return result.value.raw;
 }
 
 export function startTui(options: StartTuiOptions): TuiApplication {
