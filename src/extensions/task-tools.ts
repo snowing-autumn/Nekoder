@@ -1,11 +1,13 @@
 import type { DelegatedTaskManager } from "./delegated-task-manager.js";
 import type { AnyTool, Tool, ToolResult } from "../tools/types.js";
+import type { ConversationMessage } from "../conversation/conversation.js";
 
 export interface TaskToolsOptions {
   readonly foregroundTimeoutMs?: number;
-  readonly forkHistoryProvider?: () => readonly import("ai").ModelMessage[];
+  readonly forkHistoryProvider?: () => readonly ConversationMessage[];
   readonly inheritedSkillsProvider?: () => readonly string[];
   readonly resolveIsolation?: (agent: string | undefined, requested: "shared" | "worktree" | undefined, kind: "defined" | "fork") => "shared" | "worktree";
+  readonly requestSecrets?: (names: readonly string[]) => Promise<readonly string[]>;
 }
 
 export class TaskTools {
@@ -71,8 +73,15 @@ export class TaskTools {
     return tool("task_update", "Update this SubAgent task's phase, progress, and artifact references using version CAS.", "write", {
       expected_version: { type: "integer", minimum: 1 }, progress: { type: "string", maxLength: 4096 }, phase: { type: "string", maxLength: 4096 },
       artifacts: { type: "array", maxItems: 16, items: { type: "string" } },
+      request_secrets: { type: "array", maxItems: 16, items: { type: "string", pattern: "^[A-Za-z_][A-Za-z0-9_]*$" } },
     }, ["expected_version"], async (input) => {
-      try { return success(this.manager.update(taskId, { expectedVersion: input.expected_version, progress: input.progress, phase: input.phase, artifacts: input.artifacts })); }
+      try {
+        const task = this.manager.update(taskId, { expectedVersion: input.expected_version, progress: input.progress, phase: input.phase, artifacts: input.artifacts });
+        const grantedSecrets = input.request_secrets?.length
+          ? await this.options.requestSecrets?.(input.request_secrets) ?? (() => { throw new Error("Task Secret requests are unavailable"); })()
+          : [];
+        return success({ ...task, grantedSecrets });
+      }
       catch (error) { return failure("task_update_rejected", String(error)); }
     });
   }
@@ -88,12 +97,12 @@ function tool(
 function success(data: unknown): ToolResult<unknown> { return { ok: true, data }; }
 function failure(code: import("../tools/types.js").ToolErrorCode, message: string): ToolResult<never> { return { ok: false, error: { code, message, retryable: false } }; }
 
-function safeForkHistory(messages: readonly import("ai").ModelMessage[]): readonly import("ai").ModelMessage[] {
+function safeForkHistory(messages: readonly ConversationMessage[]): readonly ConversationMessage[] {
   const completed = new Set<string>();
   for (const message of messages) if (message.role === "tool") for (const part of message.content) if (part.type === "tool-result") completed.add(part.toolCallId);
   return messages.flatMap((message) => {
     if (message.role !== "assistant" || !Array.isArray(message.content)) return [message];
     const content = message.content.filter((part) => part.type !== "reasoning" && (part.type !== "tool-call" || part.providerExecuted || completed.has(part.toolCallId)));
-    return content.length > 0 ? [{ ...message, content } as import("ai").ModelMessage] : [];
+    return content.length > 0 ? [{ ...message, content } as ConversationMessage] : [];
   });
 }

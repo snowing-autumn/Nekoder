@@ -1,4 +1,4 @@
-import { cp, mkdir, readFile, realpath, rename, stat, symlink, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, readFile, readdir, realpath, rename, stat, symlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { load as parseYaml } from "js-yaml";
 
@@ -6,6 +6,7 @@ export interface WorktreeCommandRequest {
   readonly command: string;
   readonly cwd: string;
   readonly signal?: AbortSignal;
+  readonly waitForApproval?: <T>(request: () => Promise<T>) => Promise<T>;
 }
 
 export interface WorktreeCommandResult { readonly code: number; readonly stdout: string; readonly stderr: string }
@@ -42,7 +43,7 @@ const WINDOWS_DEVICES = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu;
 export class WorktreeManager {
   constructor(private readonly options: WorktreeManagerOptions) {}
 
-  async create(request: { taskId: string; slug: string; signal?: AbortSignal }): Promise<WorktreeRegistration> {
+  async create(request: { taskId: string; slug: string; signal?: AbortSignal; waitForApproval?: WorktreeCommandRequest["waitForApproval"] }): Promise<WorktreeRegistration> {
     validateSegment(request.taskId, "task ID");
     validateSegment(request.slug, "slug");
     const repository = await realpath(this.options.workspace);
@@ -51,15 +52,15 @@ export class WorktreeManager {
     assertContained(root, path);
     if (await exists(path)) throw new Error(`Managed Worktree path already exists: ${path}`);
     const branch = `nekoder/task/${request.taskId}-${request.slug}`;
-    await mkdir(root, { recursive: true });
-    await this.ensureIgnored(repository);
-    const head = await this.execute("git rev-parse HEAD", repository, request.signal);
+    const head = await this.execute("git rev-parse HEAD", repository, request.signal, request.waitForApproval);
     const baseCommit = head.stdout.trim();
     if (!/^[a-f0-9]{40,64}$/iu.test(baseCommit)) throw new Error("git rev-parse HEAD returned an invalid commit");
+    await this.execute(directoryCommand(root), repository, request.signal, request.waitForApproval);
     await this.execute(
       `git worktree add -b ${quote(branch)} ${quote(path)} ${quote(baseCommit)}`,
       repository,
-      request.signal
+      request.signal,
+      request.waitForApproval
     );
     const resolvedPath = await realpath(path);
     assertContained(root, resolvedPath);
@@ -90,14 +91,14 @@ export class WorktreeManager {
     return Object.freeze({ ...raw });
   }
 
-  async inspect(registration: WorktreeRegistration, signal?: AbortSignal): Promise<WorktreeInspection> {
+  async inspect(registration: WorktreeRegistration, signal?: AbortSignal, waitForApproval?: WorktreeCommandRequest["waitForApproval"]): Promise<WorktreeInspection> {
     const recovered = await this.recover(registration);
-    const [head, status, count, diff] = await Promise.all([
-      this.execute("git rev-parse HEAD", recovered.path, signal),
-      this.execute("git status --porcelain", recovered.path, signal),
-      this.execute(`git rev-list --count ${quote(`${recovered.baseCommit}..HEAD`)}`, recovered.path, signal),
-      this.execute(`git diff --stat ${quote(recovered.baseCommit)}`, recovered.path, signal),
-    ]);
+    // Approval is a task suspension point. Keep these commands sequential so a
+    // single task never owns multiple ApprovalBroker requests or queue resumes.
+    const head = await this.execute("git rev-parse HEAD", recovered.path, signal, waitForApproval);
+    const status = await this.execute("git status --porcelain", recovered.path, signal, waitForApproval);
+    const count = await this.execute(`git rev-list --count ${quote(`${recovered.baseCommit}..HEAD`)}`, recovered.path, signal, waitForApproval);
+    const diff = await this.execute(`git diff --stat ${quote(recovered.baseCommit)}`, recovered.path, signal, waitForApproval);
     return Object.freeze({
       path: recovered.path, branch: recovered.branch, baseCommit: recovered.baseCommit,
       finalCommit: head.stdout.trim(), dirty: status.stdout.trim().length > 0,
@@ -106,17 +107,17 @@ export class WorktreeManager {
     });
   }
 
-  async cleanup(registration: WorktreeRegistration, signal?: AbortSignal): Promise<{ removed: boolean; reason?: string }> {
-    const inspection = await this.inspect(registration, signal);
+  async cleanup(registration: WorktreeRegistration, signal?: AbortSignal, waitForApproval?: WorktreeCommandRequest["waitForApproval"]): Promise<{ removed: boolean; reason?: string }> {
+    const inspection = await this.inspect(registration, signal, waitForApproval);
     if (inspection.dirty) return { removed: false, reason: "dirty" };
     if (inspection.uniqueCommits > 0) return { removed: false, reason: "unique_commits" };
-    await this.execute(`git worktree remove ${quote(registration.path)}`, registration.repository, signal);
+    await this.execute(`git worktree remove ${quote(registration.path)}`, registration.repository, signal, waitForApproval);
     return { removed: true };
   }
 
-  private async execute(command: string, cwd: string, signal?: AbortSignal): Promise<WorktreeCommandResult> {
+  private async execute(command: string, cwd: string, signal?: AbortSignal, waitForApproval?: WorktreeCommandRequest["waitForApproval"]): Promise<WorktreeCommandResult> {
     if (signal?.aborted) throw new Error("Worktree provisioning was cancelled");
-    const result = await this.options.commandExecutor.execute({ command, cwd, ...(signal ? { signal } : {}) });
+    const result = await this.options.commandExecutor.execute({ command, cwd, ...(signal ? { signal } : {}), ...(waitForApproval ? { waitForApproval } : {}) });
     if (result.code !== 0) throw new Error(`Worktree command failed (${result.code}): ${result.stderr.trim() || result.stdout.trim()}`);
     return result;
   }
@@ -127,16 +128,6 @@ export class WorktreeManager {
     const temporary = `${file}.${crypto.randomUUID()}.tmp`;
     await writeFile(temporary, `${JSON.stringify(registration, null, 2)}\n`, { flag: "wx" });
     await rename(temporary, file);
-  }
-
-  private async ensureIgnored(repository: string): Promise<void> {
-    const file = join(repository, ".gitignore");
-    let content = "";
-    try { content = await readFile(file, "utf8"); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    if (content.split(/\r?\n/u).includes(".nekoder/worktrees/")) return;
-    const prefix = content.length > 0 && !content.endsWith("\n") ? "\n" : "";
-    await writeFile(file, `${content}${prefix}.nekoder/worktrees/\n`);
   }
 
   private async initializeResources(repository: string, worktree: string): Promise<void> {
@@ -154,6 +145,7 @@ export class WorktreeManager {
     for (const item of copy) {
       const source = resolve(repository, item); const target = resolve(worktree, item);
       assertContained(repository, source); assertContained(worktree, target);
+      await assertNoSymlinks(source);
       await mkdir(dirname(target), { recursive: true });
       await cp(source, target, { recursive: true, errorOnExist: true, force: false, dereference: false });
     }
@@ -189,6 +181,19 @@ function registrationPath(root: string, taskId: string): string {
 
 function quote(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
+}
+
+function directoryCommand(path: string): string {
+  return process.platform === "win32"
+    ? `New-Item -ItemType Directory -Force -Path ${quote(path)} | Out-Null`
+    : `mkdir -p ${quote(path)}`;
+}
+
+async function assertNoSymlinks(path: string): Promise<void> {
+  const info = await lstat(path);
+  if (info.isSymbolicLink()) throw new Error(`Worktree copy source contains a symbolic link: ${path}`);
+  if (!info.isDirectory()) return;
+  for (const entry of await readdir(path)) await assertNoSymlinks(join(path, entry));
 }
 
 async function exists(path: string): Promise<boolean> {

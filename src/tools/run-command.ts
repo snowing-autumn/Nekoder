@@ -24,6 +24,7 @@ const OUTPUT_LIMIT = 24 * 1024;
 
 export interface RunCommandToolOptions {
   readonly envPassthrough?: readonly string[];
+  readonly envPassthroughProvider?: () => readonly string[];
   readonly shell?: {
     readonly kind: "powershell" | "sh";
     readonly executable?: string;
@@ -91,11 +92,15 @@ export function createRunCommandTool(
     const shell = resolveShell(options.shell);
     if (!shell) return failure("execution_failed", "No supported platform shell was found");
     const started = performance.now();
+    const currentPassthrough = new Set([
+      ...envPassthrough,
+      ...(options.envPassthroughProvider?.() ?? []).map(normalizeEnvName),
+    ]);
     const env = Object.fromEntries(
       Object.entries(process.env).filter(
         (entry): entry is [string, string] =>
           entry[1] !== undefined &&
-          (!SECRET_NAME.test(entry[0]) || envPassthrough.has(normalizeEnvName(entry[0])))
+          (!SECRET_NAME.test(entry[0]) || currentPassthrough.has(normalizeEnvName(entry[0])))
       )
     );
     const launch = shell.launch(prepared.command);

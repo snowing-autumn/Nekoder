@@ -10,6 +10,7 @@ export interface SkillInstallCandidate {
   readonly path: string;
   readonly files: readonly string[];
   readonly hasCode: boolean;
+  readonly codePreview?: string;
   readonly license?: string;
   readonly compatible: boolean;
 }
@@ -42,7 +43,10 @@ export class SkillInstaller {
       const candidates = await discover(root);
       if (candidates.length === 0) throw new Error("No SKILL.md definitions were found");
       const selectedPaths = options.select ? await options.select(candidates) : candidates.length === 1 ? [candidates[0]!.path] : [];
-      if (selectedPaths.length === 0) throw new Error("Skill selection is required for a multi-Skill repository");
+      if (selectedPaths.length === 0) {
+        if (options.select) return Object.freeze([]);
+        throw new Error("Skill selection is required for a multi-Skill repository");
+      }
       const selected = candidates.filter(({ path }) => selectedPaths.includes(path));
       if (selected.length !== new Set(selectedPaths).size) throw new Error("Skill selection contains an unknown path");
       const destinationRoot = options.project
@@ -88,7 +92,13 @@ async function discover(root: string): Promise<SkillInstallCandidate[]> {
         const name = typeof frontmatter.name === "string" ? frontmatter.name : basename(directory);
         const description = typeof frontmatter.description === "string" ? frontmatter.description : "";
         const files = await listFiles(directory);
-        result.push(Object.freeze({ name, description, path: directory, files: Object.freeze(files), hasCode: files.some((path) => /^(?:scripts|src)\//u.test(path) || /\.(?:js|ts|py|sh|ps1)$/iu.test(path)),
+        const codeFiles = files.filter((path) => /^(?:scripts|src)\//u.test(path) || /\.(?:js|ts|py|sh|ps1)$/iu.test(path));
+        const codePreview = (await Promise.all(codeFiles.slice(0, 4).map(async (path) => {
+          const content = await readFile(join(directory, path), "utf8");
+          return `--- ${path} ---\n${content.slice(0, 2048)}`;
+        }))).join("\n").slice(0, 8192);
+        result.push(Object.freeze({ name, description, path: directory, files: Object.freeze(files), hasCode: codeFiles.length > 0,
+          ...(codePreview ? { codePreview } : {}),
           ...(typeof frontmatter.license === "string" ? { license: frontmatter.license } : {}), compatible: /^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(name) && description.length > 0 }));
       }
       return;

@@ -9,8 +9,10 @@ import { LLMClient } from "./llm/client.js";
 import { buildStableSystemPrompt } from "./prompt/assembler.js";
 import { collectPromptEnvironment } from "./prompt/environment.js";
 import { loadWorkspaceSecurity } from "./security/runtime.js";
+import { SecurityPolicy } from "./security/policy.js";
 import { PermissionRuleFileStore } from "./security/permission-store.js";
 import { registerCoreTools } from "./tools/core.js";
+import { createRunCommandTool } from "./tools/run-command.js";
 import { ToolRegistry } from "./tools/registry.js";
 import { ToolRunner } from "./tools/runner.js";
 import { McpManager, type McpTrustController } from "./mcp/manager.js";
@@ -37,7 +39,8 @@ import { DelegatedTaskManager, type DelegatedTaskExecutor } from "./extensions/d
 import { TaskTools } from "./extensions/task-tools.js";
 import { WorktreeManager } from "./extensions/worktree-manager.js";
 import { HookContentTrustStore, SkillCodeTrustStore } from "./extensions/content-trust.js";
-import { SkillInstaller } from "./extensions/skill-installer.js";
+import { SkillInstaller, type SkillInstallCandidate } from "./extensions/skill-installer.js";
+import { grantedSecretEnvironment, requestTaskSecretGrants } from "./extensions/task-secret-grant.js";
 import { createBuiltinSlashRegistry } from "./slash/builtins.js";
 import type { SlashCommand, SlashRegistry } from "./slash/registry.js";
 
@@ -104,7 +107,7 @@ export async function runCli(
     readonly runtime?: WorkspaceRuntime;
     readonly tasks?: () => readonly import("./extensions/delegated-task-manager.js").DelegatedTask[];
     readonly moveTaskToBackground?: (taskId: string) => void;
-    readonly skillInstall?: (source: string, project: boolean) => Promise<string>;
+    readonly skillInstall?: (source: string, project: boolean, select?: (candidates: readonly SkillInstallCandidate[]) => Promise<readonly string[]>) => Promise<string>;
     readonly skillCreate?: (name: string, description: string, project: boolean) => Promise<string>;
     readonly slashRegistry?: SlashRegistry;
     dispose(): Promise<void>;
@@ -166,7 +169,7 @@ async function createConfiguredApplication(
   readonly runtime: WorkspaceRuntime;
   readonly tasks: () => readonly import("./extensions/delegated-task-manager.js").DelegatedTask[];
   readonly moveTaskToBackground: (taskId: string) => void;
-  readonly skillInstall: (source: string, project: boolean) => Promise<string>;
+  readonly skillInstall: (source: string, project: boolean, select?: (candidates: readonly SkillInstallCandidate[]) => Promise<readonly string[]>) => Promise<string>;
   readonly skillCreate: (name: string, description: string, project: boolean) => Promise<string>;
   readonly slashRegistry: SlashRegistry;
   dispose(): Promise<void>;
@@ -215,11 +218,23 @@ async function createConfiguredApplication(
   const delegatedExecutor: DelegatedTaskExecutor = async (task, taskContext) => {
     const definition = task.agent ? definitions.agent(task.agent) : definitions.agent("general");
     if (!definition) throw new Error(`Unknown Agent Definition: ${task.agent ?? "general"}`);
+    const grantedSecrets = new Set<string>();
+    const requestSecrets = async (names: readonly string[]): Promise<readonly string[]> => {
+      const undeclared = names.find((name) => !definition.secrets.includes(name));
+      if (undeclared) throw new Error(`Task Secret was not declared by Agent ${definition.name}: ${undeclared}`);
+      const pending = names.filter((name) => !grantedSecrets.has(name));
+      const granted = await requestTaskSecretGrants({
+        taskId: task.id, names: pending, workspace, signal: taskContext.signal,
+        requestApproval: (request, decision) => taskContext.waitForApproval(() => approvalBroker.requestApproval(request, decision)),
+      });
+      for (const name of granted) grantedSecrets.add(name);
+      return Object.freeze([...grantedSecrets]);
+    };
     let childWorkspace = workspace;
     let worktreePath: string | undefined;
     let worktreeRegistration: import("./extensions/worktree-manager.js").WorktreeRegistration | undefined;
     if (task.isolation === "worktree") {
-      const registration = await worktrees.create({ taskId: task.id, slug: definition.name, signal: taskContext.signal });
+      const registration = await worktrees.create({ taskId: task.id, slug: definition.name, signal: taskContext.signal, waitForApproval: taskContext.waitForApproval });
       childWorkspace = registration.path;
       worktreePath = registration.path;
       worktreeRegistration = registration;
@@ -228,24 +243,30 @@ async function createConfiguredApplication(
     const allowed = definition.tools ? new Set(definition.tools) : undefined;
     const denied = new Set([...definition.disallowedTools, "delegate_agent", "task_list", "task_cancel"]);
     for (const { name } of registry.definitions()) {
-      if (name === "use_skill" || denied.has(name) || (allowed && !allowed.has(name))) continue;
+      if (name === "use_skill" || name === "run_command" || denied.has(name) || (task.kind === "defined" && name.startsWith("skill__")) || (allowed && !allowed.has(name))) continue;
       const candidate = registry.get(name);
       if (candidate) childRegistry.register(candidate);
     }
+    if ((!allowed || allowed.has("run_command")) && !denied.has("run_command")) childRegistry.register(createRunCommandTool({
+      envPassthroughProvider: () => [...grantedSecrets],
+      ...(config.tools.run_command?.shell ? { shell: config.tools.run_command.shell } : {}),
+    }));
     const childSkills = new SkillRun(definitions, {
       registry: childRegistry,
       authorizeCode: (skill) => skillTrust.isTrusted(workspace, skill),
       trustCode: (skill) => skillTrust.trust(workspace, skill),
+      workerEnvironment: async () => grantedSecretEnvironment([...grantedSecrets]),
     });
     childRegistry.register(childSkills.tool());
-    for (const tool of new TaskTools(taskManager).child(task.id)) childRegistry.register(tool);
+    for (const tool of new TaskTools(taskManager, { requestSecrets }).child(task.id)) childRegistry.register(tool);
     childRegistry.seal();
     const childConversation = new ConversationManager();
     if (task.kind === "fork" && taskContext.forkHistory) childConversation.replaceMessages(taskContext.forkHistory);
     const childHooks = new HookEngine(effectiveHooks);
     const childInstructions = await new InstructionLoader({ workspace: childWorkspace, homeDir: homedir() }).load();
+    const childPermissionMode = narrowPermissionMode(security.policy.getMode(), definition.permissionMode);
     const childRunner = new ToolRunner(childRegistry, {
-      authorizer: security.policy,
+      authorizer: new SecurityPolicy({ mode: childPermissionMode, rules: security.config.rules }),
       approvalHandler: {
         requestApproval: (request, decision) => taskContext.waitForApproval(() => approvalBroker.requestApproval(request, decision)),
       },
@@ -256,8 +277,8 @@ async function createConfiguredApplication(
       workspace: childWorkspace, maxSteps: Math.min(config.agent.max_steps, definition.maxSteps),
       skillRun: childSkills, hookEngine: childHooks, agentKind: "subagent",
       promptContext: {
-        permissionMode: narrowPermissionMode(security.config.mode, definition.permissionMode),
-        customInstructions: definition.instructions,
+        permissionMode: childPermissionMode,
+        customInstructions: `${definition.instructions}${definition.secrets.length ? `\n\nAvailable Task Secret names: ${definition.secrets.join(", ")}. Request only those needed through task_update.request_secrets; values are never visible to you and become available only inside approved host execution.` : ""}`,
         ...(taskContext.inheritedSkills ? { skills: taskContext.inheritedSkills } : {}),
         longTermMemory: memory.snapshot().injectionText,
         environment: collectPromptEnvironment(childWorkspace, { model: provider.model, shell: config.tools.run_command?.shell?.kind ?? (process.platform === "win32" ? "powershell" : "sh") }),
@@ -279,9 +300,9 @@ async function createConfiguredApplication(
     for await (const _event of handle.events) { /* Child events are projected through the task record. */ }
     const outcome = await handle.result;
     if (outcome.status !== "completed") throw new Error(`SubAgent ended with ${outcome.status}`);
-    const worktreeDetails = worktreeRegistration ? await worktrees.inspect(worktreeRegistration, taskContext.signal) : undefined;
+    const worktreeDetails = worktreeRegistration ? await worktrees.inspect(worktreeRegistration, taskContext.signal, taskContext.waitForApproval) : undefined;
     const cleanup = worktreeRegistration && worktreeDetails && !worktreeDetails.dirty && worktreeDetails.uniqueCommits === 0
-      ? await worktrees.cleanup(worktreeRegistration, taskContext.signal)
+      ? await worktrees.cleanup(worktreeRegistration, taskContext.signal, taskContext.waitForApproval)
       : undefined;
     return { summary: outcome.finalText, usage: outcome.usage as Record<string, number>, ...(worktreePath ? { worktree: worktreePath } : {}), ...(worktreeDetails ? { worktreeDetails } : {}), ...(cleanup ? { worktreeCleanedUp: cleanup.removed } : {}) };
   };
@@ -378,7 +399,13 @@ async function createConfiguredApplication(
   });
   const commandExecutor: import("./extensions/worktree-manager.js").WorktreeCommandExecutor = {
       async execute(request) {
-        const result = await runner.runBatch(
+        const commandRunner = request.waitForApproval ? new ToolRunner(registry, {
+          authorizer: security.policy,
+          approvalHandler: { requestApproval: (approvalRequest, decision) => request.waitForApproval!(() => approvalBroker.requestApproval(approvalRequest, decision)) },
+          maxParallelReads: config.tools.max_parallel_reads,
+          deferOutputBudget: true,
+        }) : runner;
+        const result = await commandRunner.runBatch(
           [{ toolCallId: crypto.randomUUID(), toolName: "run_command", input: { command: request.command, cwd: request.cwd } }],
           { toolBatchId: crypto.randomUUID(), workspace, taskMode: "execute", ...(request.signal ? { signal: request.signal } : {}) }
         );
@@ -482,9 +509,9 @@ async function createConfiguredApplication(
     runtime,
     tasks: () => taskManager.list(),
     moveTaskToBackground: (taskId) => { taskManager.moveToBackground(taskId); },
-    skillInstall: async (source, project) => {
-      const installed = await skillInstaller.install(source, { project });
-      return `Installed Skills: ${installed.map(({ name }) => name).join(", ")}`;
+    skillInstall: async (source, project, select) => {
+      const installed = await skillInstaller.install(source, { project, ...(select ? { select } : {}) });
+      return installed.length === 0 ? "Skill installation cancelled" : `Installed Skills: ${installed.map(({ name }) => name).join(", ")}`;
     },
     skillCreate: async (name, description, project) => `Created Skill: ${await skillInstaller.create(name, description, { project })}`,
     slashRegistry,

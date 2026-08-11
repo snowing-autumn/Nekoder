@@ -17,6 +17,7 @@ import { createBuiltinSlashRegistry } from "../slash/builtins.js";
 import { UserInputRouter } from "../slash/dispatcher.js";
 import type { SlashCommand, SlashCommandResult, SlashRegistry } from "../slash/registry.js";
 import type { DelegatedTask } from "../extensions/delegated-task-manager.js";
+import type { SkillInstallCandidate } from "../extensions/skill-installer.js";
 import type {
   RuntimeCommand,
   RuntimeCommandResult,
@@ -53,7 +54,7 @@ export interface StartTuiOptions {
   readonly runtime?: WorkspaceRuntime;
   readonly tasks?: () => readonly DelegatedTask[];
   readonly moveTaskToBackground?: (taskId: string) => void;
-  readonly skillInstall?: (source: string, project: boolean) => Promise<string>;
+  readonly skillInstall?: (source: string, project: boolean, select?: (candidates: readonly SkillInstallCandidate[]) => Promise<readonly string[]>) => Promise<string>;
   readonly skillCreate?: (name: string, description: string, project: boolean) => Promise<string>;
   readonly slashRegistry?: SlashRegistry;
 }
@@ -276,7 +277,16 @@ function NekoSidebar({
       <Text>{totalTokens(state.cumulativeUsage)}</Text>
       {session.activePlanId && <Text color={TUI_COLORS.plan}>Plan ready</Text>}
       {tasks.length > 0 && <Text dimColor>Tasks</Text>}
-      {tasks.slice(-4).map((task) => <Text key={task.id} color={task.status === "failed" ? TUI_COLORS.danger : undefined}>{task.id.slice(0, 10)} {task.status}{task.isolation === "worktree" ? " [wt]" : ""}</Text>)}
+      {tasks.slice(-2).map((task) => (
+        <Box key={task.id} flexDirection="column">
+          <Text color={task.status === "failed" ? TUI_COLORS.danger : undefined}>{task.id.slice(0, 10)} {task.status === "waiting_approval" ? "approval" : task.status}</Text>
+          <Text dimColor>{task.mode} · {task.kind} · {task.isolation}</Text>
+          {task.result?.usage && <Text dimColor>usage {totalTokens(task.result.usage)}</Text>}
+          {task.result?.worktree && <Text dimColor>wt {task.result.worktree.slice(-16)}</Text>}
+          {task.artifacts.length > 0 && <Text dimColor>artifacts {task.artifacts.length}</Text>}
+          {task.error && <Text color={TUI_COLORS.danger}>{task.error.slice(0, 20)}</Text>}
+        </Box>
+      ))}
       {debug && <Text dimColor>items {state.transcript.length}</Text>}
     </Box>
   );
@@ -337,6 +347,12 @@ function Shell({
   const [userConfirmation, setUserConfirmation] = useState<string>();
   const [localConfirmation, setLocalConfirmation] = useState<{ readonly id: string; readonly message: string }>();
   const [completion, setCompletion] = useState<{ readonly commands: readonly SlashCommand[]; readonly index: number }>();
+  const [skillSelection, setSkillSelection] = useState<{
+    readonly candidates: readonly SkillInstallCandidate[];
+    readonly index: number;
+    readonly selected: ReadonlySet<string>;
+    readonly resolve: (paths: readonly string[]) => void;
+  }>();
   const [tasks, setTasks] = useState<readonly DelegatedTask[]>(() => taskProvider?.() ?? []);
   useEffect(() => {
     if (!taskProvider) return;
@@ -365,9 +381,26 @@ function Shell({
   }, [controller]);
   usePaste(
     (text) => editComposer({ type: "insert", text }),
-    { isActive: !session.pendingApproval }
+    { isActive: !session.pendingApproval && !skillSelection }
   );
   useInput((input, key) => {
+    if (skillSelection) {
+      if (key.upArrow) setSkillSelection({ ...skillSelection, index: (skillSelection.index - 1 + skillSelection.candidates.length) % skillSelection.candidates.length });
+      else if (key.downArrow) setSkillSelection({ ...skillSelection, index: (skillSelection.index + 1) % skillSelection.candidates.length });
+      else if (input === " ") {
+        const path = skillSelection.candidates[skillSelection.index]!.path;
+        const selected = new Set(skillSelection.selected);
+        if (selected.has(path)) selected.delete(path); else selected.add(path);
+        setSkillSelection({ ...skillSelection, selected });
+      } else if (key.return) {
+        skillSelection.resolve([...skillSelection.selected]);
+        setSkillSelection(undefined);
+      } else if (key.escape) {
+        skillSelection.resolve([]);
+        setSkillSelection(undefined);
+      }
+      return;
+    }
     if (input.toLowerCase() === "b" && session.runStatus === "running") {
       const foreground = tasks.find((task) => task.mode === "foreground" && !["completed", "failed", "cancelled", "interrupted"].includes(task.status));
       if (foreground) moveTaskToBackground?.(foreground.id);
@@ -609,7 +642,7 @@ function Shell({
           );
         },
         skillInstall: skillInstall ? async (source, project) => {
-          try { return { kind: "success", message: await skillInstall(source, project) }; }
+          try { return { kind: "success", message: await skillInstall(source, project, (candidates) => new Promise((resolve) => setSkillSelection({ candidates, index: 0, selected: new Set(), resolve }))) }; }
           catch (error) { return { kind: "blocked", code: "operation_failed", message: String(error).slice(0, 500) }; }
         } : undefined,
         skillCreate: skillCreate ? async (name, description, project) => {
@@ -719,7 +752,20 @@ function Shell({
               <Text>[Y] Confirm  [N] Cancel</Text>
             </Box>
           )}
-          {!session.pendingApproval && <ComposerLine text={state.composer.text} cursor={state.composer.cursor} />}
+          {skillSelection && (
+            <Box flexDirection="column" borderStyle="round" borderColor={TUI_COLORS.approval} paddingX={1}>
+              <Text bold>Select Skills to install (Space toggle, Enter install, Esc cancel)</Text>
+              {skillSelection.candidates.map((candidate, index) => (
+                <Box key={candidate.path} flexDirection="column">
+                  <Text inverse={index === skillSelection.index}>
+                    {skillSelection.selected.has(candidate.path) ? "[x]" : "[ ]"} {candidate.name} · {candidate.compatible ? "compatible" : "incompatible"} · {candidate.hasCode ? "code" : "instructions"} · license {candidate.license ?? "unspecified"} · {candidate.description}
+                  </Text>
+                  {index === skillSelection.index && candidate.codePreview && <Text dimColor>{sanitizeTerminalText(candidate.codePreview)}</Text>}
+                </Box>
+              ))}
+            </Box>
+          )}
+          {!session.pendingApproval && !skillSelection && <ComposerLine text={state.composer.text} cursor={state.composer.cursor} />}
           {completion && (
             <Box flexDirection="column" borderStyle="round" paddingX={1}>
               {completion.commands.map((command, index) => (

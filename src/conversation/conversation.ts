@@ -7,6 +7,9 @@ import type {
   ToolResultPart,
 } from "ai";
 
+/** Provider-neutral conversation history contract owned by Nekoder's conversation boundary. */
+export type ConversationMessage = ModelMessage;
+
 // 会话历史直接以 AI SDK 的 ModelMessage 存储：它本身就是 provider 无关的抽象
 // 消息格式，往 Anthropic / OpenAI / 各家中转站的具体线上格式的转换由 ai 包在
 // 发请求时完成，这一层不需要自己维护一套中间结构。

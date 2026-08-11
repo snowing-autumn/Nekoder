@@ -1,3 +1,5 @@
+import type { ConversationMessage } from "../conversation/conversation.js";
+
 export type DelegatedTaskStatus =
   | "queued" | "provisioning" | "running" | "waiting_approval"
   | "completed" | "failed" | "cancelled" | "interrupted";
@@ -11,7 +13,7 @@ export interface DelegatedTaskRequest {
   readonly mode?: "foreground" | "background";
   readonly isolation?: "shared" | "worktree";
   readonly parentSessionId?: string;
-  readonly forkHistory?: readonly import("ai").ModelMessage[];
+  readonly forkHistory?: readonly ConversationMessage[];
   readonly inheritedSkills?: readonly string[];
 }
 
@@ -47,7 +49,7 @@ export interface DelegatedTask {
 
 export interface DelegatedTaskContext {
   readonly signal: AbortSignal;
-  readonly forkHistory?: readonly import("ai").ModelMessage[];
+  readonly forkHistory?: readonly ConversationMessage[];
   readonly inheritedSkills?: readonly string[];
   update(request: TaskUpdate): DelegatedTask;
   waitForApproval<T>(request: () => Promise<T>): Promise<T>;
@@ -77,7 +79,7 @@ interface MutableTask {
   status: DelegatedTaskStatus; version: number; progress?: string; phase?: string; artifacts: string[];
   createdAt: string; updatedAt: string; result?: DelegatedTaskResult; error?: string;
   controller: AbortController; lastModelUpdate?: number; suspended?: boolean; resume?: () => void;
-  forkHistory?: readonly import("ai").ModelMessage[]; inheritedSkills?: readonly string[];
+  forkHistory?: readonly ConversationMessage[]; inheritedSkills?: readonly string[];
 }
 
 const TERMINAL = new Set<DelegatedTaskStatus>(["completed", "failed", "cancelled", "interrupted"]);

@@ -2,6 +2,8 @@ import type { DefinitionSnapshot, SkillDefinition } from "./definition-catalog.j
 import type { Tool, ToolResult } from "../tools/types.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import { SkillWorkerClient } from "./skill-worker.js";
+import { stat } from "node:fs/promises";
+import { join } from "node:path";
 
 export interface SkillRunOptions {
   readonly maxActive?: number;
@@ -95,10 +97,13 @@ export class SkillRun {
     }
     this.activated.set(name, Object.freeze({ definition, instructions }));
     this.instructionBytes += bytes;
-    if (definition.runtime.worker) {
-      if (!this.options.registry) return this.rollback(name, bytes, "skill_worker_unavailable", "Skill Worker requires a dynamic Tool Registry");
+    const executableCode = Boolean(definition.runtime.worker) || await hasStandardCode(definition);
+    if (executableCode) {
       if (codeApproved) await this.options.trustCode?.(definition);
       if (!codeApproved && !await this.options.authorizeCode?.(definition)) return this.rollback(name, bytes, "skill_code_trust_required", `Executable Skill ${name} requires content trust`);
+    }
+    if (definition.runtime.worker) {
+      if (!this.options.registry) return this.rollback(name, bytes, "skill_worker_unavailable", "Skill Worker requires a dynamic Tool Registry");
       let worker: SkillWorkerClient;
       try {
         worker = await SkillWorkerClient.start({
@@ -166,12 +171,19 @@ export class SkillRun {
       async prepare(input) { return { ok: true, data: input }; },
       authorizationTarget: async (input) => {
         const definition = this.snapshot.skill(input.name);
-        const needsApproval = Boolean(definition?.runtime.worker) || input.mode === "delegated";
-        return { ok: true, data: { primary: definition?.runtime.worker ? `skill-code:${input.name}:${definition.contentHash}` : `skill:${input.name}`, ...(needsApproval ? { dynamic: true as const, maxApprovalScope: "once" as const } : {}) } };
+        const executableCode = definition ? Boolean(definition.runtime.worker) || await hasStandardCode(definition) : false;
+        const untrustedCode = executableCode && definition ? !await this.options.authorizeCode?.(definition) : false;
+        const needsApproval = untrustedCode || input.mode === "delegated";
+        return { ok: true, data: { primary: untrustedCode && definition ? `skill-code:${input.name}:${definition.contentHash}` : `skill:${input.name}`, ...(needsApproval ? { dynamic: true as const, maxApprovalScope: "once" as const } : {}) } };
       },
       execute: async (input) => this.activate(input.name, input.arguments ?? "", input.mode ?? "inline", [], true),
     };
   }
+}
+
+async function hasStandardCode(definition: SkillDefinition): Promise<boolean> {
+  try { return (await stat(join(definition.source.path, "scripts"))).isDirectory(); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
 }
 
 function substitute(content: string, argumentsText: string, skillDirectory: string): string {
