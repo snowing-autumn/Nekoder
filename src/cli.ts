@@ -1,13 +1,20 @@
+import { homedir } from "node:os";
+import { createInterface, type Interface as ReadlineInterface } from "node:readline/promises";
+
 import { AgentSession } from "./agent/session.js";
-import { loadConfig, resolveModelLimits } from "./config/config.js";
+import { loadConfig, resolveModelLimits, type McpServerConfig } from "./config/config.js";
 import { ConversationManager } from "./conversation/conversation.js";
 import { LLMClient } from "./llm/client.js";
 import { buildStableSystemPrompt } from "./prompt/assembler.js";
 import { collectPromptEnvironment } from "./prompt/environment.js";
 import { loadWorkspaceSecurity } from "./security/runtime.js";
 import { PermissionRuleFileStore } from "./security/permission-store.js";
-import { createCoreToolRegistry } from "./tools/core.js";
+import { registerCoreTools } from "./tools/core.js";
+import { ToolRegistry } from "./tools/registry.js";
 import { ToolRunner } from "./tools/runner.js";
+import { McpManager, type McpTrustController } from "./mcp/manager.js";
+import { SdkMcpConnector } from "./mcp/sdk-connector.js";
+import { McpTrustStore } from "./mcp/trust.js";
 import { ApprovalBroker } from "./tui/approval-broker.js";
 import { createDemoApplication } from "./tui/demo.js";
 import { SessionController } from "./tui/session-controller.js";
@@ -68,11 +75,21 @@ export async function runCli(
   }
 
   const workspace = process.cwd();
-  let controller: SessionController;
+  let configured: {
+    readonly controller: SessionController;
+    readonly toolNames?: readonly string[];
+    readonly permissionSources?: readonly string[];
+    readonly mcpDiagnostics?: () => ReturnType<McpManager["diagnostics"]>;
+    readonly initialMessages?: readonly string[];
+    dispose(): Promise<void>;
+  };
   try {
-    controller = options.demo
-      ? createDemoApplication(workspace).controller
-      : await createConfiguredController(workspace);
+    if (options.demo) {
+      const demo = createDemoApplication(workspace);
+      configured = { controller: demo.controller, async dispose() {} };
+    } else {
+      configured = await createConfiguredApplication(workspace, io);
+    }
   } catch (error) {
     io.stderr.write(`Unable to initialize Nekoder: ${sanitizeTerminalText(String(error))}\n`);
     return 1;
@@ -82,10 +99,15 @@ export async function runCli(
     ...io,
     workspace,
     taskMode: "execute",
-    controller,
+    controller: configured.controller,
     debug: options.debug,
     plainIcons: options.plainIcons,
     reduceMotion: options.reduceMotion,
+    onDispose: () => configured.dispose(),
+    toolNames: configured.toolNames,
+    permissionSources: configured.permissionSources,
+    mcpDiagnostics: configured.mcpDiagnostics,
+    initialMessages: configured.initialMessages,
   });
   const stop = (): void => { void app.stop(); };
   process.once("SIGINT", stop);
@@ -100,7 +122,17 @@ export async function runCli(
   }
 }
 
-async function createConfiguredController(workspace: string): Promise<SessionController> {
+async function createConfiguredApplication(
+  workspace: string,
+  io: { readonly stdin: NodeJS.ReadStream; readonly stdout: NodeJS.WriteStream }
+): Promise<{
+  readonly controller: SessionController;
+  readonly toolNames: readonly string[];
+  readonly permissionSources: readonly string[];
+  readonly mcpDiagnostics: () => ReturnType<McpManager["diagnostics"]>;
+  readonly initialMessages: readonly string[];
+  dispose(): Promise<void>;
+}> {
   const config = loadConfig(workspace);
   const security = loadWorkspaceSecurity(workspace);
   const provider = config.providers[0];
@@ -111,7 +143,8 @@ async function createConfiguredController(workspace: string): Promise<SessionCon
     buildStableSystemPrompt(),
     limits
   );
-  const registry = createCoreToolRegistry({
+  const registry = new ToolRegistry();
+  registerCoreTools(registry, {
     skipDirs: config.tools.skip_dirs,
     sensitiveReads: security.config.sensitiveReads,
     ...(config.tools.run_command ? {
@@ -125,6 +158,24 @@ async function createConfiguredController(workspace: string): Promise<SessionCon
       },
     } : {}),
   });
+  const mcpManager = new McpManager(new SdkMcpConnector());
+  const trustStore = new McpTrustStore({ homeDir: homedir() });
+  let readline: ReadlineInterface | undefined;
+  const trust: McpTrustController = {
+    isTrusted: (root, server, serverConfig) => trustStore.isTrusted(root, server, serverConfig),
+    async requestTrust(request) {
+      readline ??= createInterface({ input: io.stdin, output: io.stdout });
+      const answer = await readline.question(formatMcpTrustPrompt(request.server, request.config));
+      return /^(?:y|yes)$/i.test(answer.trim());
+    },
+    trust: (root, server, serverConfig) => trustStore.trust(root, server, serverConfig),
+  };
+  try {
+    await mcpManager.start(config.mcp_servers, registry, { workspace, trust });
+  } finally {
+    readline?.close();
+  }
+  registry.seal();
   const approvalBroker = new ApprovalBroker();
   const shell = config.tools.run_command?.shell?.kind
     ?? (process.platform === "win32" ? "powershell" : "sh");
@@ -154,5 +205,63 @@ async function createConfiguredController(workspace: string): Promise<SessionCon
       environmentProvider: environment,
     },
   });
-  return new SessionController(session, approvalBroker, security.config.mode);
+  const controller = new SessionController(
+    session,
+    approvalBroker,
+    security.config.mode,
+    (mode) => security.policy.setMode(mode)
+  );
+  const mcpDiagnostics = mcpManager.diagnostics();
+  const connectedMcp = mcpDiagnostics.filter(({ status }) => status === "connected").length;
+  const unavailableMcp = mcpDiagnostics.length - connectedMcp;
+  return {
+    controller,
+    toolNames: registry.definitions().map(({ name }) => name),
+    permissionSources: Object.entries(security.config.rules)
+      .filter(([, rules]) => rules.length > 0)
+      .map(([source]) => source),
+    mcpDiagnostics: () => mcpManager.diagnostics(),
+    initialMessages: mcpDiagnostics.length === 0
+      ? []
+      : [`MCP startup: ${connectedMcp} connected, ${unavailableMcp} unavailable or skipped. Use /status for details.`],
+    dispose: () => mcpManager.close(),
+  };
+}
+
+function formatMcpTrustPrompt(
+  server: string,
+  config: Exclude<McpServerConfig, { readonly enabled: false }>
+): string {
+  const referencedVariables = new Set<string>();
+  const values = config.transport === "stdio"
+    ? Object.values(config.env ?? {})
+    : Object.values(config.headers ?? {});
+  for (const value of values) {
+    for (const match of value.matchAll(/(?<!\$)\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g)) {
+      referencedVariables.add(match[1]!);
+    }
+  }
+  const target = config.transport === "stdio"
+    ? [config.command, ...(config.args ?? [])].join(" ")
+    : redactedHttpTarget(config.url);
+  const headerNames = config.transport === "http" ? Object.keys(config.headers ?? {}) : [];
+  return [
+    `Workspace MCP Server '${server}' requests trust.`,
+    `Transport: ${config.transport}; target: ${target}`,
+    referencedVariables.size > 0 ? `Environment variables: ${[...referencedVariables].sort().join(", ")}` : undefined,
+    headerNames.length > 0 ? `HTTP headers: ${headerNames.sort().join(", ")}` : undefined,
+    config.transport === "stdio"
+      ? "This command runs with your user permissions and is not OS-sandboxed."
+      : "The remote Server receives the explicitly configured headers.",
+    "Trust this exact Workspace configuration? [y/N] ",
+  ].filter((line): line is string => line !== undefined).join("\n");
+}
+
+function redactedHttpTarget(rawUrl: string): string {
+  const url = new URL(rawUrl);
+  url.username = "";
+  url.password = "";
+  url.search = "";
+  url.hash = "";
+  return url.toString();
 }

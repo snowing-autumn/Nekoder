@@ -22,6 +22,8 @@ export type ToolErrorCode =
   | "timeout"
   | "cancelled"
   | "execution_failed"
+  | "mcp_server_unavailable"
+  | "mcp_protocol_error"
   | "filesystem_error"
   | "output_limit_exceeded"
   | "batch_limit_exceeded"
@@ -57,6 +59,7 @@ export interface ToolExecutionContext extends ToolPreparationContext {}
 
 export interface AuthorizationTarget {
   readonly primary: string;
+  readonly maxApprovalScope?: "once" | "session" | "persistent";
   readonly cwd?: string;
   readonly shell?: "powershell" | "sh";
   readonly commands?: readonly string[];

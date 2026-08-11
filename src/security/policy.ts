@@ -14,7 +14,19 @@ export interface SecurityPolicyOptions {
 }
 
 export class SecurityPolicy {
-  constructor(private readonly options: SecurityPolicyOptions) {}
+  private mode: PermissionMode;
+
+  constructor(private readonly options: SecurityPolicyOptions) {
+    this.mode = options.mode;
+  }
+
+  getMode(): PermissionMode {
+    return this.mode;
+  }
+
+  setMode(mode: PermissionMode): void {
+    this.mode = mode;
+  }
 
   authorize(request: ToolAuthorizationRequest): AuthorizationDecision {
     if (request.authorizationTarget?.protectedWritePath === "permission_control_plane") {
@@ -48,7 +60,7 @@ export class SecurityPolicy {
     }
     if (request.authorizationTarget?.sensitive === true) {
       const scopes: readonly ApprovalScope[] =
-        this.options.mode === "strict" || this.options.mode === "plan"
+        this.mode === "strict" || this.mode === "plan"
           ? ["once"]
           : ["once", "session"];
       return ask(request, scopes, "mandatory_approval", "Sensitive Read requires approval");
@@ -66,10 +78,10 @@ export class SecurityPolicy {
         return ruleDecision?.kind === "deny" ? ruleDecision : ask(request, ["once"]);
       }
     }
-    if (this.options.mode === "strict") {
+    if (this.mode === "strict") {
       return ruleDecision?.kind === "deny" ? ruleDecision : ask(request, ["once"]);
     }
-    if (this.options.mode === "plan") {
+    if (this.mode === "plan") {
       if (request.effect === "write") {
         return {
           kind: "deny",
@@ -82,7 +94,7 @@ export class SecurityPolicy {
       }
     }
     if (ruleDecision) return ruleDecision;
-    switch (this.options.mode) {
+    switch (this.mode) {
       case "plan":
         return allow();
       case "default":
@@ -237,6 +249,17 @@ function ask(
     kind: "ask",
     source,
     reason,
-    allowedScopes,
+    allowedScopes: capApprovalScopes(allowedScopes, request.authorizationTarget?.maxApprovalScope),
   };
+}
+
+function capApprovalScopes(
+  scopes: readonly ApprovalScope[],
+  maximum: "once" | "session" | "persistent" | undefined
+): readonly ApprovalScope[] {
+  if (maximum === undefined || maximum === "persistent") return scopes;
+  if (maximum === "session") {
+    return scopes.filter((scope) => scope === "once" || scope === "session");
+  }
+  return scopes.filter((scope) => scope === "once");
 }

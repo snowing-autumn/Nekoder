@@ -17,12 +17,19 @@ export interface CoreToolOptions {
 
 export function createCoreToolRegistry(options: CoreToolOptions = {}): ToolRegistry {
   const registry = new ToolRegistry();
+  registerCoreTools(registry, options);
+  registry.seal();
+  return registry;
+}
+
+export function registerCoreTools(
+  registry: ToolRegistry,
+  options: CoreToolOptions = {}
+): void {
   registry.register(editFileTool);
   registry.register(createFindFilesTool(options.skipDirs));
   registry.register(createReadFileTool(options.sensitiveReads));
   registry.register(createRunCommandTool(options.runCommand));
   registry.register(createSearchTextTool(options.skipDirs));
   registry.register(writeFileTool);
-  registry.seal();
-  return registry;
 }

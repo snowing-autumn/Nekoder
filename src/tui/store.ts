@@ -88,6 +88,13 @@ export type TuiAction =
   | { readonly type: "composer_reset" }
   | { readonly type: "scroll"; readonly delta: number }
   | { readonly type: "local_notice"; readonly message: string }
+  | {
+      readonly type: "local_message";
+      readonly level: "info" | "success" | "error";
+      readonly message: string;
+      readonly preserveComposer?: boolean;
+    }
+  | { readonly type: "clear_transcript" }
   | { readonly type: "focus_browse" }
   | { readonly type: "focus_compose" }
   | { readonly type: "browse_move"; readonly delta: number }
@@ -124,6 +131,31 @@ export function reduceTuiAction(state: TuiState, action: TuiAction): TuiState {
             message: action.message,
           },
         ],
+      };
+    case "local_message":
+      return {
+        ...state,
+        transcript: [
+          ...state.transcript,
+          {
+            id: `local-message:${state.transcript.length}`,
+            type: "run_notice",
+            status: action.level,
+            message: action.message,
+          },
+        ],
+        composer: action.preserveComposer ? state.composer : createComposerBuffer(),
+        focus: action.preserveComposer ? state.focus : "compose",
+        selectedTranscriptIndex: action.preserveComposer ? state.selectedTranscriptIndex : undefined,
+      };
+    case "clear_transcript":
+      return {
+        ...state,
+        transcript: [],
+        composer: createComposerBuffer(),
+        scrollOffset: 0,
+        focus: "compose",
+        selectedTranscriptIndex: undefined,
       };
     case "focus_browse": {
       if (state.transcript.length === 0) return state;

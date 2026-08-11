@@ -62,15 +62,40 @@ export interface ProviderConfig {
   max_output_tokens?: number;
 }
 
-export interface McpServerConfig {
-  name: string;
-  command: string;
-  args?: string[];
+export type McpServerSource = "user" | "workspace-root" | "workspace-nekoder";
+
+interface McpServerBaseConfig {
+  readonly connect_timeout_ms: number;
+  readonly call_timeout_ms: number;
+  readonly source: McpServerSource;
 }
+
+export interface McpStdioServerConfig extends McpServerBaseConfig {
+  readonly transport: "stdio";
+  readonly command: string;
+  readonly args?: string[];
+  readonly env?: Record<string, string>;
+}
+
+export interface McpHttpServerConfig extends McpServerBaseConfig {
+  readonly transport: "http";
+  readonly url: string;
+  readonly headers?: Record<string, string>;
+}
+
+export interface McpDisabledServerConfig {
+  readonly enabled: false;
+  readonly source: McpServerSource;
+}
+
+export type McpServerConfig =
+  | McpStdioServerConfig
+  | McpHttpServerConfig
+  | McpDisabledServerConfig;
 
 export interface Config {
   providers: ProviderConfig[];
-  mcp_servers: McpServerConfig[];
+  mcp_servers: Record<string, McpServerConfig>;
   enable_coordinator_mode: boolean;
   tools: ToolsConfig;
   agent: AgentConfig;
@@ -109,19 +134,21 @@ export function loadConfig(
     }
   }
   const userConfigPath = join(home, ".nekoder", "config.yaml");
-  const paths = [
-    userConfigPath,
-    join(cwd, "config.yaml"),
-    join(cwd, ".nekoder", "config.yaml"),
-  ].filter((path) => existsSync(path));
-  if (paths.length === 0) {
+  const layers = [
+    { path: userConfigPath, source: "user" as const },
+    { path: join(cwd, "config.yaml"), source: "workspace-root" as const },
+    { path: join(cwd, ".nekoder", "config.yaml"), source: "workspace-nekoder" as const },
+  ].filter(({ path }) => existsSync(path));
+  if (layers.length === 0) {
     throw new ConfigError(
       "找不到配置文件。请创建 config.yaml、.nekoder/config.yaml 或 ~/.nekoder/config.yaml。"
     );
   }
 
   let merged: Record<string, unknown> = {};
-  for (const path of paths) {
+  const mcpServers: Record<string, unknown> = {};
+  const mcpSources: Record<string, McpServerSource> = {};
+  for (const { path, source } of layers) {
     let raw: unknown;
     try {
       raw = parseYaml(readFileSync(path, "utf8"));
@@ -129,9 +156,18 @@ export function loadConfig(
       throw new ConfigError(`解析 ${path} 失败：${String(err)}`);
     }
     validatePartialConfig(raw, path, path === userConfigPath);
-    merged = deepMerge(merged, raw as Record<string, unknown>);
+    const layer = { ...(raw as Record<string, unknown>) };
+    if (isPlainObject(layer.mcp_servers)) {
+      for (const [name, server] of Object.entries(layer.mcp_servers)) {
+        mcpServers[name] = server;
+        mcpSources[name] = source;
+      }
+      delete layer.mcp_servers;
+    }
+    merged = deepMerge(merged, layer);
   }
-  return parseConfig(merged, paths.join(" + "));
+  if (Object.keys(mcpServers).length > 0) merged.mcp_servers = mcpServers;
+  return parseConfig(merged, layers.map(({ path }) => path).join(" + "), mcpSources);
 }
 
 const ROOT_KEYS = new Set([
@@ -153,6 +189,8 @@ const PROVIDER_KEYS = new Set([
   "context_window",
   "max_output_tokens",
 ]);
+const MCP_SERVER_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
+const MCP_COMMON_KEYS = ["enabled", "transport", "connect_timeout_ms", "call_timeout_ms"] as const;
 
 function validatePartialConfig(raw: unknown, path: string, userGlobal: boolean): void {
   if (!isPlainObject(raw)) throw new ConfigError(`${path} 顶层必须是对象。`);
@@ -165,24 +203,11 @@ function validatePartialConfig(raw: unknown, path: string, userGlobal: boolean):
     });
   }
   if (raw.mcp_servers !== undefined) {
-    if (!Array.isArray(raw.mcp_servers)) {
-      throw new ConfigError(`${path} mcp_servers 必须是数组。`);
+    if (!isPlainObject(raw.mcp_servers)) throw new ConfigError(`${path} mcp_servers 必须是对象。`);
+    for (const [name, server] of Object.entries(raw.mcp_servers)) {
+      if (!isPlainObject(server)) throw new ConfigError(`${path} mcp_servers.${name} 必须是对象。`);
+      validateMcpServerConfig(name, server, path);
     }
-    raw.mcp_servers.forEach((server, index) => {
-      if (!isPlainObject(server)) {
-        throw new ConfigError(`${path} mcp_servers[${index}] 必须是对象。`);
-      }
-      rejectUnknown(server, new Set(["name", "command", "args"]), `${path} mcp_servers[${index}]`);
-      if (server.name !== undefined && typeof server.name !== "string") {
-        throw new ConfigError(`${path} mcp_servers[${index}].name 必须是字符串。`);
-      }
-      if (server.command !== undefined && typeof server.command !== "string") {
-        throw new ConfigError(`${path} mcp_servers[${index}].command 必须是字符串。`);
-      }
-      if (server.args !== undefined && (!Array.isArray(server.args) || server.args.some((arg) => typeof arg !== "string"))) {
-        throw new ConfigError(`${path} mcp_servers[${index}].args 必须是字符串数组。`);
-      }
-    });
   }
   if (raw.enable_coordinator_mode !== undefined && typeof raw.enable_coordinator_mode !== "boolean") {
     throw new ConfigError(`${path} enable_coordinator_mode 必须是布尔值。`);
@@ -223,6 +248,88 @@ function validatePartialConfig(raw: unknown, path: string, userGlobal: boolean):
   }
 }
 
+function validateMcpServerConfig(
+  name: string,
+  server: Record<string, unknown>,
+  path: string
+): void {
+  const where = `${path} mcp_servers.${name}`;
+  if (!MCP_SERVER_NAME.test(name)) {
+    throw new ConfigError(`${where} 名称必须匹配 ${MCP_SERVER_NAME.source}。`);
+  }
+  if (server.enabled === false) {
+    rejectUnknown(server, new Set(["enabled"]), where);
+    return;
+  }
+  if (server.enabled !== undefined && server.enabled !== true) {
+    throw new ConfigError(`${where}.enabled 必须是布尔值。`);
+  }
+  if (server.transport === "stdio") {
+    rejectUnknown(
+      server,
+      new Set([...MCP_COMMON_KEYS, "command", "args", "env"]),
+      where
+    );
+    if (typeof server.command !== "string" || server.command.length === 0) {
+      throw new ConfigError(`${where}.command 必须是非空字符串。`);
+    }
+    if (
+      server.args !== undefined
+      && (!Array.isArray(server.args) || server.args.some((arg) => typeof arg !== "string"))
+    ) {
+      throw new ConfigError(`${where}.args 必须是字符串数组。`);
+    }
+    validateStringMap(server.env, `${where}.env`);
+  } else if (server.transport === "http") {
+    rejectUnknown(
+      server,
+      new Set([...MCP_COMMON_KEYS, "url", "headers"]),
+      where
+    );
+    if (typeof server.url !== "string") throw new ConfigError(`${where}.url 必须是字符串。`);
+    validateMcpUrl(server.url, `${where}.url`);
+    validateStringMap(server.headers, `${where}.headers`);
+  } else {
+    throw new ConfigError(`${where}.transport 必须是 stdio 或 http。`);
+  }
+  validateIntegerRange(server.connect_timeout_ms, 1_000, 60_000, `${where}.connect_timeout_ms`);
+  validateIntegerRange(server.call_timeout_ms, 1_000, 600_000, `${where}.call_timeout_ms`);
+}
+
+function validateStringMap(value: unknown, where: string): void {
+  if (value === undefined) return;
+  if (!isPlainObject(value) || Object.values(value).some((entry) => typeof entry !== "string")) {
+    throw new ConfigError(`${where} 必须是字符串 map。`);
+  }
+}
+
+function validateIntegerRange(
+  value: unknown,
+  minimum: number,
+  maximum: number,
+  where: string
+): void {
+  if (value === undefined) return;
+  if (!Number.isInteger(value) || Number(value) < minimum || Number(value) > maximum) {
+    throw new ConfigError(`${where} 必须是 ${minimum}–${maximum} 的整数。`);
+  }
+}
+
+function validateMcpUrl(value: string, where: string): void {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new ConfigError(`${where} 必须是有效 URL。`);
+  }
+  const loopback = url.hostname === "localhost"
+    || url.hostname === "127.0.0.1"
+    || url.hostname === "[::1]";
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
+    throw new ConfigError(`${where} 必须使用 HTTPS；HTTP 只允许 loopback。`);
+  }
+}
+
 function validateRunCommandConfig(raw: unknown, path: string): void {
   if (!isPlainObject(raw)) throw new ConfigError(`${path} tools.run_command 必须是对象。`);
   rejectUnknown(raw, new Set(["shell", "env_passthrough"]), `${path} tools.run_command`);
@@ -257,7 +364,11 @@ function deepMerge(
   return result;
 }
 
-function parseConfig(raw: unknown, path: string): Config {
+function parseConfig(
+  raw: unknown,
+  path: string,
+  mcpSources: Readonly<Record<string, McpServerSource>>
+): Config {
   const root = raw as Partial<Config> | null;
   const providers = root?.providers;
   if (!Array.isArray(providers) || providers.length === 0) {
@@ -268,7 +379,7 @@ function parseConfig(raw: unknown, path: string): Config {
 
   return {
     providers,
-    mcp_servers: Array.isArray(root?.mcp_servers) ? root.mcp_servers : [],
+    mcp_servers: parseMcpServers(root?.mcp_servers, mcpSources),
     enable_coordinator_mode: root?.enable_coordinator_mode === true,
     tools: {
       skip_dirs: root?.tools?.skip_dirs ?? ["node_modules", "dist", "build", "coverage"],
@@ -278,6 +389,41 @@ function parseConfig(raw: unknown, path: string): Config {
     agent: { max_steps: root?.agent?.max_steps ?? 20 },
     prompt: root?.prompt ?? {},
   };
+}
+
+function parseMcpServers(
+  raw: unknown,
+  sources: Readonly<Record<string, McpServerSource>>
+): Record<string, McpServerConfig> {
+  if (!isPlainObject(raw)) return {};
+  const result: Record<string, McpServerConfig> = {};
+  for (const [name, value] of Object.entries(raw)) {
+    if (!isPlainObject(value)) continue;
+    const source = sources[name] ?? "user";
+    if (value.enabled === false) {
+      result[name] = { enabled: false, source };
+    } else if (value.transport === "http") {
+      result[name] = {
+        transport: "http",
+        url: String(value.url ?? ""),
+        connect_timeout_ms: Number(value.connect_timeout_ms ?? 10_000),
+        call_timeout_ms: Number(value.call_timeout_ms ?? 60_000),
+        source,
+        ...(isPlainObject(value.headers) ? { headers: value.headers as Record<string, string> } : {}),
+      };
+    } else {
+      result[name] = {
+        transport: "stdio",
+        command: String(value.command ?? ""),
+        connect_timeout_ms: Number(value.connect_timeout_ms ?? 10_000),
+        call_timeout_ms: Number(value.call_timeout_ms ?? 60_000),
+        source,
+        ...(Array.isArray(value.args) ? { args: value.args as string[] } : {}),
+        ...(isPlainObject(value.env) ? { env: value.env as Record<string, string> } : {}),
+      };
+    }
+  }
+  return result;
 }
 
 function validateProvider(p: ProviderConfig, where: string): void {

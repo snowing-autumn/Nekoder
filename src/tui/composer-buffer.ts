@@ -12,6 +12,7 @@ interface ComposerSnapshot {
 
 export type ComposerAction =
   | { readonly type: "insert"; readonly text: string }
+  | { readonly type: "replace_range"; readonly start: number; readonly end: number; readonly text: string }
   | { readonly type: "move_left" }
   | { readonly type: "move_right" }
   | { readonly type: "move_home" }
@@ -40,6 +41,17 @@ export function applyComposerAction(
           buffer.text.slice(buffer.cursor),
         buffer.cursor + Math.min(action.text.length, Math.max(0, 65_536 - buffer.text.length))
       );
+    case "replace_range": {
+      const start = Math.max(0, Math.min(buffer.text.length, action.start));
+      const end = Math.max(start, Math.min(buffer.text.length, action.end));
+      const available = 65_536 - (buffer.text.length - (end - start));
+      const replacement = action.text.slice(0, Math.max(0, available));
+      return commit(
+        buffer,
+        buffer.text.slice(0, start) + replacement + buffer.text.slice(end),
+        start + replacement.length
+      );
+    }
     case "move_left":
       return { ...buffer, cursor: previousBoundary(buffer.text, buffer.cursor) };
     case "move_right":

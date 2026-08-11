@@ -1,4 +1,5 @@
 import React, { useEffect, useReducer, useRef, useState } from "react";
+import { resolve as resolvePath } from "node:path";
 import {
   Box,
   Text,
@@ -10,13 +11,17 @@ import {
 } from "ink";
 
 import type { TaskMode } from "../agent/types.js";
-import type { ApprovalDecision } from "../security/types.js";
+import type { ApprovalDecision, PermissionMode } from "../security/types.js";
+import type { McpDiagnostic } from "../mcp/manager.js";
+import { createBuiltinSlashRegistry } from "../slash/builtins.js";
+import { SlashDispatcher } from "../slash/dispatcher.js";
+import type { SlashCommand, SlashCommandResult } from "../slash/registry.js";
 import {
   applyComposerAction,
   createComposerBuffer,
   type ComposerAction,
 } from "./composer-buffer.js";
-import type { SessionController, SessionSnapshot } from "./session-controller.js";
+import type { ControllerResult, SessionController, SessionSnapshot } from "./session-controller.js";
 import { parseSgrMouse } from "./mouse-input.js";
 import { parseSafeMarkdown } from "./markdown.js";
 import { createTuiState, reduceTuiAction, type TranscriptItem } from "./store.js";
@@ -33,6 +38,11 @@ export interface StartTuiOptions {
   readonly debug?: boolean;
   readonly plainIcons?: boolean;
   readonly reduceMotion?: boolean;
+  readonly onDispose?: () => void | Promise<void>;
+  readonly toolNames?: readonly string[];
+  readonly permissionSources?: readonly string[];
+  readonly mcpDiagnostics?: () => readonly McpDiagnostic[];
+  readonly initialMessages?: readonly string[];
 }
 
 export interface TuiApplication {
@@ -41,6 +51,8 @@ export interface TuiApplication {
   waitUntilExit(): Promise<void>;
   stop(): Promise<void>;
 }
+
+const BUILTIN_SLASH_REGISTRY = createBuiltinSlashRegistry();
 
 function TranscriptLine({
   item,
@@ -84,7 +96,8 @@ function TranscriptLine({
 }
 
 function noticeColor(status: string): "red" | "green" | "yellow" | undefined {
-  if (status === "completed") return TUI_COLORS.success;
+  if (status === "completed" || status === "success") return TUI_COLORS.success;
+  if (status === "info") return undefined;
   if (status === "cancelled" || status === "rejected") return TUI_COLORS.approval;
   return TUI_COLORS.danger;
 }
@@ -158,6 +171,8 @@ function ApprovalCard({
       : typeof record.cwd === "string" ? record.cwd : pending.request.workspace
   );
   const target = pending.request.authorizationTarget;
+  const isMcp = pending.request.toolName.startsWith("mcp_");
+  const displayedInput = isMcp ? redactApprovalInput(input) : input;
   const decision = pending.authorizationDecision;
   const scopes = decision?.allowedScopes ?? ["once"];
   return (
@@ -169,11 +184,12 @@ function ApprovalCard({
       {target && <Text>target: {sanitizeTerminalText(target.primary)}</Text>}
       {target?.requestedPath && <Text>requested: {sanitizeTerminalText(target.requestedPath)}</Text>}
       {target?.resolvedPath && <Text>resolved: {sanitizeTerminalText(target.resolvedPath)}</Text>}
-      <Text>input: {sanitizeTerminalText(JSON.stringify(input))}</Text>
+      <Text>input: {sanitizeTerminalText(JSON.stringify(displayedInput)).slice(0, 2_048)}</Text>
       {pending.request.toolName === "run_command" && <Text>command: {command}</Text>}
       {pending.request.toolName === "run_command" && <Text>cwd: {cwd}</Text>}
       {decision && <Text>scopes: {decision.allowedScopes.join(", ")}</Text>}
       {pending.request.toolName === "run_command" && <Text color={TUI_COLORS.approval}>Nekoder cannot prove this command has no side effects.</Text>}
+      {isMcp && <Text color={TUI_COLORS.approval}>This MCP Server is not constrained to the Workspace and is not OS-sandboxed.</Text>}
       {confirmingUser && <Text color={TUI_COLORS.danger}>This rule applies across all Workspaces. Press U again to confirm.</Text>}
       <Text>
         {!confirmingUser && scopes.includes("once") && <><Text bold>[Y]</Text> Allow once  </>}
@@ -190,6 +206,19 @@ function ApprovalCard({
 function totalTokens(usage: object): string {
   const values = Object.values(usage).filter((value: unknown): value is number => typeof value === "number");
   return values.length === 0 ? "—" : values.reduce((sum, value) => sum + value, 0).toLocaleString();
+}
+
+export function redactApprovalInput(value: unknown, depth = 0): unknown {
+  if (depth >= 8) return "[TRUNCATED]";
+  if (typeof value === "string") return value.length <= 512 ? value : `${value.slice(0, 512)}[TRUNCATED]`;
+  if (Array.isArray(value)) return value.slice(0, 20).map((item) => redactApprovalInput(item, depth + 1));
+  if (typeof value !== "object" || value === null) return value;
+  return Object.fromEntries(Object.entries(value).slice(0, 50).map(([key, child]) => [
+    key,
+    /(?:secret|token|password|authorization|api[_-]?key|credential)/iu.test(key)
+      ? "[REDACTED]"
+      : redactApprovalInput(child, depth + 1),
+  ]));
 }
 
 function NekoSidebar({
@@ -247,6 +276,10 @@ function Shell({
   controller,
   debug,
   plainIcons,
+  toolNames = [],
+  permissionSources = [],
+  mcpDiagnostics,
+  initialMessages = [],
   onInputReady,
   onRequestExit,
 }: ShellProps) {
@@ -258,13 +291,32 @@ function Shell({
     composerRef.current = state.composer;
   }, [state.composer]);
   const editComposer = (action: ComposerAction): void => {
+    setCompletion(undefined);
     composerRef.current = applyComposerAction(composerRef.current, action);
     dispatch({ type: "composer", action });
+  };
+  const completeComposer = (command: SlashCommand): void => {
+    const firstWhitespace = composerRef.current.text.search(/\s/u);
+    const end = firstWhitespace < 0 ? composerRef.current.text.length : firstWhitespace;
+    editComposer({
+      type: "replace_range",
+      start: 0,
+      end,
+      text: `/${command.name}${command.argumentHint ? " " : ""}`,
+    });
   };
   const [session, setSession] = useState<SessionSnapshot>(() =>
     controller?.getSnapshot() ?? { taskMode, permissionMode: "default", runStatus: "idle" }
   );
   const [userConfirmation, setUserConfirmation] = useState<string>();
+  const [localConfirmation, setLocalConfirmation] = useState<string>();
+  const [completion, setCompletion] = useState<{ readonly commands: readonly SlashCommand[]; readonly index: number }>();
+  const initialMessagesPublished = useRef(false);
+  useEffect(() => {
+    if (initialMessagesPublished.current) return;
+    initialMessagesPublished.current = true;
+    for (const message of initialMessages) dispatch({ type: "local_message", level: "info", message });
+  }, [initialMessages]);
   useEffect(() => {
     setUserConfirmation(undefined);
   }, [session.pendingApproval?.requestId]);
@@ -306,9 +358,43 @@ function Shell({
       else if (session.runStatus === "idle") onRequestExit();
       return;
     }
+    if (localConfirmation) {
+      const answer = input.toLowerCase();
+      if (answer === "y") {
+        controller?.setPermissionMode("permissive");
+        setLocalConfirmation(undefined);
+        dispatch({ type: "local_message", level: "success", message: "Permission Mode changed to permissive for this session" });
+      } else if (answer === "n" || key.escape) {
+        setLocalConfirmation(undefined);
+        dispatch({ type: "local_message", level: "info", message: "Permission Mode was not changed" });
+      }
+      return;
+    }
     if (key.escape && session.runStatus === "running" && !session.pendingApproval) {
       dispatch({ type: "cancel_requested" });
       controller?.cancelActiveRun();
+      return;
+    }
+    if (completion) {
+      if (key.escape) {
+        setCompletion(undefined);
+        return;
+      } else if (key.upArrow) setCompletion({
+        ...completion,
+        index: (completion.index - 1 + completion.commands.length) % completion.commands.length,
+      });
+      else if (key.downArrow || key.tab) setCompletion({
+        ...completion,
+        index: (completion.index + 1) % completion.commands.length,
+      });
+      else if (key.return) {
+        completeComposer(completion.commands[completion.index]!);
+        setCompletion(undefined);
+      } else {
+        setCompletion(undefined);
+        // Continue below so the key that dismissed the menu still edits the Composer.
+        return void (input && editComposer({ type: "insert", text: input }));
+      }
       return;
     }
     if (session.pendingApproval) {
@@ -336,6 +422,18 @@ function Shell({
       return;
     }
     if (key.tab) {
+      const slashPrefix = slashCompletionPrefix(composerRef.current);
+      if (state.focus === "compose" && slashPrefix !== undefined) {
+        const commands = uniqueCompletionCommands(BUILTIN_SLASH_REGISTRY.complete(slashPrefix));
+        if (commands.length === 1) {
+          completeComposer(commands[0]!);
+          return;
+        }
+        if (commands.length > 1) {
+          setCompletion({ commands, index: 0 });
+          return;
+        }
+      }
       dispatch({ type: state.focus === "browse" ? "focus_compose" : "focus_browse" });
       return;
     }
@@ -351,16 +449,59 @@ function Shell({
     if (key.return && !key.shift) {
       const text = composerRef.current.text;
       if (!text.trim() || !controller) return;
-      const result = controller.submit(text);
-      if (result.ok && result.action === "run_started") {
-        composerRef.current = createComposerBuffer();
-        dispatch({ type: "user_submitted", text });
-      } else if (result.ok && result.action === "mode_changed") {
-        composerRef.current = createComposerBuffer();
-        dispatch({ type: "composer_reset" });
-      } else if (!result.ok) {
-        dispatch({ type: "local_notice", message: result.message });
-      }
+      setCompletion(undefined);
+      const slash = new SlashDispatcher(BUILTIN_SLASH_REGISTRY, () => ({
+        runActive: controller.getSnapshot().runStatus === "running",
+        enterPlanMode: () => controllerResult(controller.enterPlanMode(), "/plan"),
+        executeActivePlan: () => controllerResult(controller.executeActivePlan(), "/do"),
+        startPrompt: (modelText, displayText) => controllerResult(controller.startUserRun(modelText), displayText),
+        clearTranscript: () => dispatch({ type: "clear_transcript" }),
+        status: () => formatStatus({
+          workspace,
+          session: controller.getSnapshot(),
+          state,
+          toolNames,
+          permissionSources,
+          diagnostics: mcpDiagnostics?.() ?? [],
+        }),
+        permission: () => {
+          const snapshot = controller.getSnapshot();
+          return {
+            base: snapshot.permissionMode,
+            effective: effectivePermission(snapshot.permissionMode, snapshot.taskMode),
+            sources: permissionSources,
+          };
+        },
+        setPermission: (mode) => { controller.setPermissionMode(mode); },
+        confirmPermissive: () => {
+          const confirmationId = "permission-permissive";
+          setLocalConfirmation(confirmationId);
+          return {
+            kind: "confirmation_required",
+            confirmationId,
+            message: "Permissive Mode allows most operations without approval. Nekoder has no OS sandbox. [Y] Confirm  [N] Cancel",
+          };
+        },
+      }));
+      void slash.submit(text).then((result) => {
+        const preserveComposer = result.kind === "blocked" && result.code === "run_active";
+        if (!preserveComposer) composerRef.current = createComposerBuffer();
+        if (result.kind === "run_started") {
+          dispatch({ type: "user_submitted", text: result.displayText });
+        } else if (result.kind === "success") {
+          if (!result.clearTranscript) dispatch({ type: "composer_reset" });
+          if (result.message) dispatch({ type: "local_message", level: "success", message: result.message });
+        } else if (result.kind === "info") {
+          dispatch({ type: "local_message", level: "info", message: result.message });
+        } else if (result.kind === "confirmation_required") {
+          dispatch({ type: "composer_reset" });
+        } else {
+          const message = result.kind === "usage_error"
+            ? `${result.message}\nUsage: ${result.usage}`
+            : result.message;
+          dispatch({ type: "local_message", level: "error", message, preserveComposer });
+        }
+      });
       return;
     }
     if (key.return && key.shift) {
@@ -436,10 +577,26 @@ function Shell({
             session={session}
             confirmingUser={userConfirmation === session.pendingApproval?.requestId}
           />
+          {localConfirmation && (
+            <Box flexDirection="column" borderStyle="round" borderColor={TUI_COLORS.approval} paddingX={1}>
+              <Text bold>Local confirmation required</Text>
+              <Text>Permissive Mode allows most operations without approval. Nekoder has no OS sandbox.</Text>
+              <Text>[Y] Confirm  [N] Cancel</Text>
+            </Box>
+          )}
           {!session.pendingApproval && <ComposerLine text={state.composer.text} cursor={state.composer.cursor} />}
+          {completion && (
+            <Box flexDirection="column" borderStyle="round" paddingX={1}>
+              {completion.commands.map((command, index) => (
+                <Text key={command.name} inverse={index === completion.index}>
+                  /{command.name} - {command.description}
+                </Text>
+              ))}
+            </Box>
+          )}
           <Text>
             <Text color={session.taskMode === "plan" ? TUI_COLORS.plan : TUI_COLORS.execute}>[{session.taskMode === "plan" ? "PLAN" : "EXECUTE"}]</Text>{" "}
-            <Text>[{session.permissionMode.toUpperCase()}]</Text>{" "}
+            <Text>permission: {session.permissionMode}</Text>{" "}
             <Text color={runStateColor(session.pendingApproval ? "awaiting_approval" : state.runVisualState)}>
               {(session.pendingApproval ? "awaiting_approval" : state.runVisualState).toUpperCase()}
             </Text>
@@ -513,6 +670,74 @@ function mouseApprovalDecision(
   return option("[N] Deny", { kind: "deny" });
 }
 
+function controllerResult(result: ControllerResult, displayText: string): SlashCommandResult {
+  if (result.ok && result.action === "run_started") {
+    return { kind: "run_started", agentRunId: result.agentRunId, displayText };
+  }
+  if (result.ok) return { kind: "success", message: `Task Mode changed to ${result.taskMode}` };
+  return {
+    kind: "blocked",
+    code: result.code === "no_active_plan" ? "no_active_plan" : result.code === "run_active" ? "run_active" : "unavailable",
+    message: result.message,
+  };
+}
+
+function slashCompletionPrefix(buffer: ReturnType<typeof createComposerBuffer>): string | undefined {
+  if (!buffer.text.startsWith("/")) return undefined;
+  const firstWhitespace = buffer.text.search(/\s/u);
+  const tokenEnd = firstWhitespace < 0 ? buffer.text.length : firstWhitespace;
+  if (buffer.cursor > tokenEnd) return undefined;
+  return buffer.text.slice(1, buffer.cursor);
+}
+
+function uniqueCompletionCommands(
+  completions: ReturnType<typeof BUILTIN_SLASH_REGISTRY.complete>
+): SlashCommand[] {
+  const commands = new Map<string, SlashCommand>();
+  for (const completion of completions) commands.set(completion.command.name, completion.command);
+  return [...commands.values()].sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function effectivePermission(base: PermissionMode, taskMode: TaskMode): PermissionMode {
+  if (taskMode === "execute") return base;
+  return base === "strict" ? "strict" : "plan";
+}
+
+function formatStatus(options: {
+  readonly workspace: string;
+  readonly session: SessionSnapshot;
+  readonly state: ReturnType<typeof createTuiState>;
+  readonly toolNames: readonly string[];
+  readonly permissionSources: readonly string[];
+  readonly diagnostics: readonly McpDiagnostic[];
+}): string {
+  const planTools = new Set(["read_file", "find_files", "search_text", "run_command"]);
+  const visible = options.session.taskMode === "execute"
+    ? [...options.toolNames]
+    : options.toolNames.filter((name) => planTools.has(name));
+  const hidden = options.toolNames.length - visible.length;
+  const mcp = options.diagnostics.length === 0
+    ? "none"
+    : options.diagnostics.map((item) =>
+        `${item.server}: ${item.status}, tools ${item.registeredTools}/${item.discoveredTools}${item.restartRequired ? ", restart required" : ""}`
+      ).join("\n  ");
+  return [
+    `Task Mode: ${options.session.taskMode.toUpperCase()}`,
+    `Base Permission: ${options.session.permissionMode}`,
+    `Effective Permission: ${effectivePermission(options.session.permissionMode, options.session.taskMode)}`,
+    `Permission sources: ${options.permissionSources.join(", ") || "none"}`,
+    `Agent Run: ${options.session.runStatus}`,
+    `Active Plan: ${options.session.activePlanId ?? "none"}`,
+    `Current tokens: ${totalTokens(options.state.usage)}`,
+    `Cumulative tokens: ${totalTokens(options.state.cumulativeUsage)}`,
+    `Workspace: ${resolvePath(options.workspace)}`,
+    `Enabled Tools: ${visible.join(", ") || "none"}`,
+    `Hidden Tools: ${hidden}`,
+    `MCP:\n  ${mcp}`,
+    "Memory: not implemented",
+  ].join("\n");
+}
+
 export function startTui(options: StartTuiOptions): TuiApplication {
   let resolveInputReady!: () => void;
   const inputReady = new Promise<void>((resolve) => {
@@ -545,6 +770,7 @@ export function startTui(options: StartTuiOptions): TuiApplication {
       stopped ??= (async () => {
         options.stdout.write("\u001B[?1006l\u001B[?1000l");
         options.controller?.dispose();
+        await options.onDispose?.();
         instance.unmount();
         await instance.waitUntilExit();
       })().finally(resolveClosed);

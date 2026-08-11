@@ -49,16 +49,23 @@ export interface AgentSessionDependencies {
 
 export class AgentSession {
   private active = false;
+  private permissionMode: "strict" | "plan" | "default" | "acceptEdit" | "permissive";
   private activePlan:
     | { readonly id: string; readonly originalGoal: string; readonly text: string; readonly createdAt: string }
     | undefined;
   private pendingUserGoal = "";
 
   constructor(private readonly dependencies: AgentSessionDependencies) {
+    this.permissionMode = dependencies.promptContext?.permissionMode ?? "default";
     const maxSteps = dependencies.maxSteps ?? 20;
     if (!Number.isInteger(maxSteps) || maxSteps < 1 || maxSteps > 50) {
       throw new Error("agent.max_steps must be an integer from 1 to 50");
     }
+  }
+
+  setPermissionMode(mode: "strict" | "plan" | "default" | "acceptEdit" | "permissive"): void {
+    if (this.active) throw new Error("Cannot change Permission Mode during an active run");
+    this.permissionMode = mode;
   }
 
   startUserRun(text: string, taskMode: TaskMode): AgentRunHandle {
@@ -358,7 +365,7 @@ export class AgentSession {
     const configured = this.dependencies.promptContext;
     return buildSupplementalSystemTexts({
       taskMode,
-      permissionMode: configured?.permissionMode ?? "default",
+      permissionMode: this.permissionMode,
       modelCallNumber,
       environment: safeEnvironment(
         configured?.environmentProvider,

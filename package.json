@@ -13,6 +13,7 @@
     "test:integration": "bun test tests/integration/message-roundtrip.test.ts"
   },
   "devDependencies": {
+    "@modelcontextprotocol/server": "^2.0.0",
     "@types/bun": "latest",
     "@types/node": "^26.1.2",
     "@types/react": "^19.2.0",
@@ -25,6 +26,7 @@
     "@ai-sdk/anthropic": "^4",
     "@ai-sdk/openai": "^4",
     "@ai-sdk/openai-compatible": "^3",
+    "@modelcontextprotocol/client": "^2.0.0",
     "ai": "^7",
     "ajv": "^8.20.0",
     "ink": "7.1.1",

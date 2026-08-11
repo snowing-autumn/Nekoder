@@ -40,7 +40,8 @@ export class SessionController {
   constructor(
     private readonly session: AgentSession,
     private readonly approvalBroker?: ApprovalBroker,
-    permissionMode: PermissionMode = "default"
+    permissionMode: PermissionMode = "default",
+    private readonly permissionModeSetter?: (mode: PermissionMode) => void
   ) {
     this.snapshot = { taskMode: "execute", permissionMode, runStatus: "idle" };
     this.unsubscribeApproval = approvalBroker?.subscribe((pendingApproval) => {
@@ -53,6 +54,14 @@ export class SessionController {
 
   getSnapshot(): SessionSnapshot {
     return { ...this.snapshot };
+  }
+
+  setPermissionMode(mode: PermissionMode): boolean {
+    if (this.activeHandle) return false;
+    this.session.setPermissionMode(mode);
+    this.permissionModeSetter?.(mode);
+    this.setSnapshot({ ...this.snapshot, permissionMode: mode });
+    return true;
   }
 
   subscribe(listener: (snapshot: SessionSnapshot) => void): () => void {
@@ -70,25 +79,44 @@ export class SessionController {
     if (!command) {
       return { ok: false, code: "blank_input", message: "User input must not be blank" };
     }
-    if (this.activeHandle) {
-      return { ok: false, code: "run_active", message: "An agent run is already active" };
-    }
     if (command === "/plan") {
-      this.setSnapshot({ ...this.snapshot, taskMode: "plan" });
-      return { ok: true, action: "mode_changed", taskMode: "plan" };
+      return this.enterPlanMode();
     }
     if (command === "/do") {
-      if (!this.snapshot.activePlanId) {
-        return { ok: false, code: "no_active_plan", message: "No active plan" };
-      }
-      const handle = this.session.executeActivePlan();
-      this.setSnapshot({ ...this.snapshot, taskMode: "execute", runStatus: "running" });
-      this.track(handle);
-      return { ok: true, action: "run_started", agentRunId: handle.agentRunId };
+      return this.executeActivePlan();
     }
+    return this.startUserRun(rawText);
+  }
 
+  enterPlanMode(): ControllerResult {
+    if (this.activeHandle) return runActiveResult();
+    this.setSnapshot({ ...this.snapshot, taskMode: "plan" });
+    return { ok: true, action: "mode_changed", taskMode: "plan" };
+  }
+
+  executeActivePlan(): ControllerResult {
+    if (this.activeHandle) return runActiveResult();
+    if (!this.snapshot.activePlanId) {
+      return { ok: false, code: "no_active_plan", message: "No active plan" };
+    }
+    const handle = this.session.executeActivePlan();
+    this.setSnapshot({ ...this.snapshot, taskMode: "execute", runStatus: "running", activePlanId: undefined });
+    this.track(handle);
+    return { ok: true, action: "run_started", agentRunId: handle.agentRunId };
+  }
+
+  startUserRun(rawText: string): ControllerResult {
+    if (!rawText.trim()) {
+      return { ok: false, code: "blank_input", message: "User input must not be blank" };
+    }
+    if (this.activeHandle) return runActiveResult();
     const handle = this.session.startUserRun(rawText, this.snapshot.taskMode);
-    this.setSnapshot({ ...this.snapshot, taskMode: this.snapshot.taskMode, runStatus: "running" });
+    this.setSnapshot({
+      ...this.snapshot,
+      taskMode: this.snapshot.taskMode,
+      runStatus: "running",
+      activePlanId: undefined,
+    });
     this.track(handle);
     return { ok: true, action: "run_started", agentRunId: handle.agentRunId };
   }
@@ -143,4 +171,8 @@ export class SessionController {
     this.snapshot = snapshot;
     for (const listener of this.snapshotListeners) listener(this.getSnapshot());
   }
+}
+
+function runActiveResult(): ControllerResult {
+  return { ok: false, code: "run_active", message: "An agent run is already active" };
 }
