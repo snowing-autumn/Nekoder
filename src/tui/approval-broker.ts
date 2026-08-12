@@ -19,6 +19,7 @@ interface PendingEntry extends PendingApproval {
 
 export class ApprovalBroker implements ApprovalHandler {
   private pending: PendingEntry | undefined;
+  private readonly queue: PendingEntry[] = [];
   private readonly listeners = new Set<(pending: PendingApproval | undefined) => void>();
 
   constructor(private readonly idFactory: () => string = () => crypto.randomUUID()) {}
@@ -27,30 +28,25 @@ export class ApprovalBroker implements ApprovalHandler {
     request: ToolAuthorizationRequest,
     authorizationDecision?: AskDecision
   ): Promise<ApprovalDecision> {
-    if (this.pending) throw new Error("An approval request is already pending");
     if (request.signal?.aborted) return Promise.resolve({ kind: "deny" });
 
     return new Promise<ApprovalDecision>((resolve) => {
       const requestId = this.idFactory();
-      const finish = (decision: ApprovalDecision): void => {
-        if (this.pending?.requestId !== requestId) return;
-        if (this.pending.onAbort && request.signal) {
-          request.signal.removeEventListener("abort", this.pending.onAbort);
-        }
-        this.pending = undefined;
-        this.notify();
-        resolve(decision);
-      };
+      const finish = (decision: ApprovalDecision): void => this.finish(requestId, decision, resolve);
       const onAbort = request.signal ? () => finish({ kind: "deny" }) : undefined;
-      this.pending = {
+      const entry: PendingEntry = {
         requestId,
         request,
         finish,
         ...(authorizationDecision ? { authorizationDecision } : {}),
         ...(onAbort ? { onAbort } : {}),
       };
-      this.notify();
       if (onAbort) request.signal!.addEventListener("abort", onAbort, { once: true });
+      if (this.pending) this.queue.push(entry);
+      else {
+        this.pending = entry;
+        this.notify();
+      }
     });
   }
 
@@ -81,7 +77,26 @@ export class ApprovalBroker implements ApprovalHandler {
   }
 
   dispose(): void {
-    this.pending?.finish({ kind: "deny" });
+    while (this.pending) this.pending.finish({ kind: "deny" });
+  }
+
+  private finish(
+    requestId: string,
+    decision: ApprovalDecision,
+    resolve: (decision: ApprovalDecision) => void
+  ): void {
+    const active = this.pending?.requestId === requestId;
+    const queuedIndex = active ? -1 : this.queue.findIndex((entry) => entry.requestId === requestId);
+    const entry = active ? this.pending : queuedIndex >= 0 ? this.queue[queuedIndex] : undefined;
+    if (!entry) return;
+    if (entry.onAbort && entry.request.signal) entry.request.signal.removeEventListener("abort", entry.onAbort);
+    if (active) {
+      this.pending = this.queue.shift();
+      this.notify();
+    } else {
+      this.queue.splice(queuedIndex, 1);
+    }
+    resolve(decision);
   }
 
   private notify(): void {

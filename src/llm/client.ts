@@ -193,10 +193,10 @@ export class LLMClient implements ModelInvoker {
 
 export function assembleSystemContent(
   stableSystemPrompt: string,
-  request: Pick<ModelCollectRequest, "systemInstructions" | "instructions">
+  request: Pick<ModelCollectRequest, "systemInstructions" | "instructions" | "omitStableSystemPrompt">
 ): string {
   return [
-    stableSystemPrompt,
+    ...(request.omitStableSystemPrompt ? [] : [stableSystemPrompt]),
     ...(request.systemInstructions ?? []),
     ...(request.instructions === undefined ? [] : [request.instructions]),
   ].filter((part) => part.length > 0).join("\n\n");
@@ -204,7 +204,7 @@ export function assembleSystemContent(
 
 export function buildProviderInstructions(
   stableSystemPrompt: string,
-  request: Pick<ModelCollectRequest, "systemInstructions" | "instructions">,
+  request: Pick<ModelCollectRequest, "systemInstructions" | "instructions" | "omitStableSystemPrompt">,
   anthropic: boolean
 ): SystemModelMessage[] {
   const stable: SystemModelMessage = {
@@ -213,7 +213,7 @@ export function buildProviderInstructions(
     ...(anthropic ? { providerOptions: EPHEMERAL } : {}),
   };
   return [
-    stable,
+    ...(request.omitStableSystemPrompt ? [] : [stable]),
     ...(request.systemInstructions ?? []).map((content): SystemModelMessage => ({
       role: "system",
       content,

@@ -166,8 +166,7 @@ async function loadHooks(
       const fileContent = await readFile(file, "utf8");
       const raw = parseYaml(fileContent);
       if (!isRecord(raw) || raw.version !== 1 || !Array.isArray(raw.hooks)) throw definitionError("hook_file_invalid", "Hook file requires version 1 and hooks array");
-      const contentHash = createHash("sha256").update(fileContent).digest("hex");
-      const fileRules = raw.hooks.map((value, order) => parseHookRule(value, source.kind, file, order, contentHash));
+      const fileRules = raw.hooks.map((value, order) => parseHookRule(value, source.kind, file, order));
       const ids = new Set<string>();
       if (fileRules.some((rule) => ids.has(rule.id) || !ids.add(rule.id))) throw definitionError("hook_duplicate_id", "Hook file contains a duplicate ID");
       new HookEngine(fileRules);
@@ -187,13 +186,33 @@ async function loadHooks(
   return result;
 }
 
-function parseHookRule(value: unknown, source: DefinitionSourceKind, path: string, order: number, contentHash: string): HookRule {
+function parseHookRule(value: unknown, source: DefinitionSourceKind, path: string, order: number): HookRule {
   if (!isRecord(value) || typeof value.id !== "string" || typeof value.event !== "string" || !isRecord(value.action)) throw definitionError("hook_rule_invalid", "Hook requires id, event, and action");
   const actionRaw = value.action;
-  const actions = ["prompt", "deny", "subagent"].filter((key) => key in actionRaw);
+  const actions = ["http", "command", "prompt", "subagent", "deny"].filter((key) => key in actionRaw);
   if (actions.length !== 1) throw definitionError("hook_action_invalid", "Hook action must contain exactly one action");
   let action: HookRule["action"];
-  if ("prompt" in actionRaw) {
+  if ("http" in actionRaw) {
+    const http = actionRaw.http;
+    if (!isRecord(http) || typeof http.url !== "string") throw definitionError("hook_action_invalid", "http requires a url");
+    if (http.headers !== undefined && (!isRecord(http.headers) || Object.values(http.headers).some((value) => typeof value !== "string"))) throw definitionError("hook_action_invalid", "http headers must be strings");
+    action = { http: {
+      url: http.url,
+      ...(typeof http.method === "string" ? { method: http.method } : {}),
+      ...(isRecord(http.headers) ? { headers: http.headers as Record<string, string> } : {}),
+      ...(typeof http.body === "string" ? { body: http.body } : {}),
+      ...(typeof http.timeout_ms === "number" ? { timeout_ms: http.timeout_ms } : {}),
+    } };
+  } else if ("command" in actionRaw) {
+    const command = actionRaw.command;
+    if (typeof command === "string") action = { command: { command } };
+    else if (isRecord(command) && typeof command.command === "string") action = { command: {
+      command: command.command,
+      ...(typeof command.cwd === "string" ? { cwd: command.cwd } : {}),
+      ...(typeof command.timeout_ms === "number" ? { timeout_ms: command.timeout_ms } : {}),
+    } };
+    else throw definitionError("hook_action_invalid", "command requires a command string");
+  } else if ("prompt" in actionRaw) {
     const prompt = actionRaw.prompt;
     action = { prompt: { message: typeof prompt === "string" ? prompt : isRecord(prompt) && typeof prompt.message === "string" ? prompt.message : (() => { throw definitionError("hook_action_invalid", "prompt requires a message"); })() } };
   } else if ("deny" in actionRaw) {
@@ -206,7 +225,7 @@ function parseHookRule(value: unknown, source: DefinitionSourceKind, path: strin
     action = { subagent: { agent: delegated.agent, task: delegated.task } };
   }
   return Object.freeze({ id: value.id, event: value.event as HookRule["event"], ...(value.if === undefined ? {} : { if: value.if as import("./condition-matcher.js").Condition }), once: value.once === true,
-    action, source, path, order, contentHash, trusted: source !== "project" || "deny" in action });
+    action, source, path, order });
 }
 
 async function loadAgents(

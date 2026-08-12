@@ -1,4 +1,4 @@
-import React, { useEffect, useReducer, useRef, useState } from "react";
+import React, { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { resolve as resolvePath } from "node:path";
 import {
   Box,
@@ -15,7 +15,7 @@ import type { ApprovalDecision, PermissionMode } from "../security/types.js";
 import type { McpDiagnostic } from "../mcp/manager.js";
 import { createBuiltinSlashRegistry } from "../slash/builtins.js";
 import { UserInputRouter } from "../slash/dispatcher.js";
-import type { SlashCommand, SlashCommandResult, SlashRegistry } from "../slash/registry.js";
+import type { ProviderSlashAction, SlashCommand, SlashCommandResult, SlashRegistry } from "../slash/registry.js";
 import type { DelegatedTask } from "../extensions/delegated-task-manager.js";
 import type { SkillInstallCandidate } from "../extensions/skill-installer.js";
 import type {
@@ -41,6 +41,10 @@ export interface StartTuiOptions {
   readonly stdout: NodeJS.WriteStream;
   readonly stderr: NodeJS.WriteStream;
   readonly workspace: string;
+  readonly model?: string;
+  readonly currentModel?: () => string;
+  readonly contextUsage?: () => { readonly used: number; readonly total: number };
+  readonly provider?: (action: ProviderSlashAction) => SlashCommandResult | Promise<SlashCommandResult>;
   readonly taskMode: TaskMode;
   readonly controller?: SessionController;
   readonly debug?: boolean;
@@ -67,6 +71,9 @@ export interface TuiApplication {
 }
 
 const BUILTIN_SLASH_REGISTRY = createBuiltinSlashRegistry();
+const SIDEBAR_WIDTH = 24;
+const SIDEBAR_GAP = 1;
+const SIDEBAR_MIN_COLUMNS = 120;
 
 function TranscriptLine({
   item,
@@ -79,11 +86,11 @@ function TranscriptLine({
 }) {
   switch (item.type) {
     case "user":
-      return <Text><Text bold color={TUI_COLORS.user}>You  </Text>{sanitizeTerminalText(item.text)}</Text>;
+      return <Text wrap="wrap"><Text bold color={TUI_COLORS.user}>{plainIcons ? "*" : "●"} You  </Text>{sanitizeTerminalText(item.text)}</Text>;
     case "assistant":
       return (
         <Box flexDirection="column">
-          <Text bold color={TUI_COLORS.assistant}>Nekoder{item.interrupted ? " · interrupted" : ""}</Text>
+          <Text bold color={TUI_COLORS.assistant}>{plainIcons ? "*" : "◆"} Nekoder{item.interrupted ? " · interrupted" : ""}</Text>
           <MarkdownContent source={item.text} />
         </Box>
       );
@@ -94,16 +101,16 @@ function TranscriptLine({
       const target = primaryToolTarget(item.input);
       return (
         <Box flexDirection="column">
-          <Text color={toolColor(item)}>{selected ? ">" : " "} {icon} {sanitizeTerminalText(item.toolName)}{target ? ` · ${target}` : ""} · {item.status}</Text>
-          {item.expanded && <Text dimColor>    Input: {formatToolValue(item.input)}</Text>}
-          {item.result && <Text dimColor>    Result: {formatToolValue(item.result.ok ? item.result.data : item.result.error, item.expanded ? 1_000 : 160)}</Text>}
+          <Text wrap="wrap" color={toolColor(item)}>{selected ? ">" : " "} {icon} {sanitizeTerminalText(item.toolName)}{target ? ` · ${target}` : ""} · {item.status}</Text>
+          {item.expanded && <Text wrap="wrap" dimColor>    Input: {formatToolValue(item.input)}</Text>}
+          {item.result && <Text wrap="wrap" dimColor>    Result: {formatToolValue(item.result.ok ? item.result.data : item.result.error, item.expanded ? 1_000 : 160)}</Text>}
         </Box>
       );
     }
     case "run_notice":
       return (
-        <Text color={noticeColor(item.status)}>
-          {item.status.toUpperCase()}{item.message ? ` · ${sanitizeTerminalText(item.message)}` : ""}
+        <Text wrap="wrap" color={noticeColor(item.status)}>
+          {plainIcons ? "*" : "○"} {item.status.toUpperCase()}{item.message ? ` · ${sanitizeTerminalText(item.message)}` : ""}
         </Text>
       );
   }
@@ -121,16 +128,16 @@ function MarkdownContent({ source }: { readonly source: string }) {
     <Box flexDirection="column" paddingLeft={2}>
       {parseSafeMarkdown(source).map((block, index) => {
         switch (block.type) {
-          case "heading": return <Text key={index} bold>{"#".repeat(block.level)} {block.text}</Text>;
-          case "bullet": return <Text key={index}>• {block.text}</Text>;
-          case "quote": return <Text key={index} dimColor>│ {block.text}</Text>;
-          case "code": return <Text key={index} dimColor>{block.language ? `[${block.language}]\n` : ""}{block.text}</Text>;
+          case "heading": return <Text key={index} wrap="wrap" bold>{"#".repeat(block.level)} {block.text}</Text>;
+          case "bullet": return <Text key={index} wrap="wrap">• {block.text}</Text>;
+          case "quote": return <Text key={index} wrap="wrap" dimColor>│ {block.text}</Text>;
+          case "code": return <Text key={index} wrap="wrap" dimColor>{block.language ? `[${block.language}]\n` : ""}{block.text}</Text>;
           case "table": return (
             <Box key={index} flexDirection="column">
-              {block.rows.map((row, rowIndex) => <Text key={rowIndex}>{row.join(" · ")}</Text>)}
+              {block.rows.map((row, rowIndex) => <Text key={rowIndex} wrap="wrap">{row.join(" · ")}</Text>)}
             </Box>
           );
-          case "text": return <Text key={index}>{block.text}</Text>;
+          case "text": return <Text key={index} wrap="wrap">{block.text}</Text>;
         }
       })}
     </Box>
@@ -238,17 +245,24 @@ export function redactApprovalInput(value: unknown, depth = 0): unknown {
 function NekoSidebar({
   session,
   state,
+  model,
+  contextUsage,
   debug,
   screenReader,
   tasks = [],
 }: {
   readonly session: SessionSnapshot;
   readonly state: ReturnType<typeof createTuiState>;
+  readonly model?: string;
+  readonly contextUsage?: { readonly used: number; readonly total: number };
   readonly debug?: boolean;
   readonly screenReader?: boolean;
   readonly tasks?: readonly DelegatedTask[];
 }) {
   const visual = session.pendingApproval ? "awaiting_approval" : state.runVisualState;
+  const contextRatio = contextUsage && contextUsage.total > 0
+    ? Math.min(1, contextUsage.used / contextUsage.total)
+    : 0;
   const cat = state.composer.text
     ? "  /\\_/\\\n ( o.O ) ?\n  > ^ < /\n ( / \\ )"
     : visual === "generating"
@@ -263,14 +277,21 @@ function NekoSidebar({
               ? "  /\\_/\\\n ( ^.^ )\n  > ω < /\n ( / \\ )"
               : "  /\\_/\\\n ( o.o )\n  > ^ < /\n ( / \\ )";
   return (
-    <Box width={24} height="100%" flexShrink={0} flexDirection="column" borderStyle="single" borderColor={TUI_COLORS.chrome} paddingX={1} overflow="hidden">
+    <Box width={SIDEBAR_WIDTH} height="100%" flexShrink={0} flexDirection="column" borderStyle="single" borderColor={TUI_COLORS.chrome} paddingX={1} overflow="hidden">
       {!screenReader && <Text color={TUI_COLORS.chrome}>{cat}</Text>}
+      <Text dimColor>Model</Text>
+      <Text color={TUI_COLORS.brand}>{sanitizeTerminalText(model ?? "unknown")}</Text>
       <Text dimColor>Mode</Text>
       <Text color={session.taskMode === "plan" ? TUI_COLORS.plan : TUI_COLORS.execute}>{session.taskMode === "plan" ? "PLAN" : "EXECUTE"}</Text>
       <Text dimColor>Permission</Text>
       <Text>{session.permissionMode.toUpperCase()}</Text>
       <Text dimColor>State</Text>
       <Text color={runStateColor(visual)}>{visual.toUpperCase()}</Text>
+      <Text dimColor>Context</Text>
+      <Text>{contextUsage ? `${compactTokenCount(contextUsage.used)} / ${compactTokenCount(contextUsage.total)}` : "unknown"}</Text>
+      <Text color={contextRatio >= 0.9 ? TUI_COLORS.danger : contextRatio >= 0.75 ? TUI_COLORS.approval : TUI_COLORS.brand}>
+        {contextProgressBar(contextRatio)} {Math.round(contextRatio * 100)}%
+      </Text>
       <Text dimColor>Current tokens</Text>
       <Text>{totalTokens(state.usage)}</Text>
       <Text dimColor>Cumulative</Text>
@@ -299,6 +320,10 @@ interface ShellProps extends StartTuiOptions {
 
 function Shell({
   workspace,
+  model,
+  currentModel,
+  contextUsage,
+  provider,
   taskMode,
   controller,
   debug,
@@ -317,18 +342,30 @@ function Shell({
   onRequestExit,
 }: ShellProps) {
   const { columns, rows } = useWindowSize();
+  const showSidebar = columns >= SIDEBAR_MIN_COLUMNS;
+  const mainContentWidth = columns - (showSidebar ? SIDEBAR_WIDTH + SIDEBAR_GAP : 0);
   const screenReader = process.env.INK_SCREEN_READER === "true";
   const [state, dispatch] = useReducer(reduceTuiAction, undefined, createTuiState);
+  const contextStats = useMemo(
+    () => contextUsage?.(),
+    [contextUsage, state.runVisualState, state.transcript.length]
+  );
   const composerRef = useRef(state.composer);
   const selectedSlashRef = useRef<SlashCommand | undefined>(undefined);
   useEffect(() => {
     composerRef.current = state.composer;
   }, [state.composer]);
   const editComposer = (action: ComposerAction): void => {
-    setCompletion(undefined);
+    const next = applyComposerAction(composerRef.current, action);
     selectedSlashRef.current = undefined;
-    composerRef.current = applyComposerAction(composerRef.current, action);
+    composerRef.current = next;
     dispatch({ type: "composer", action });
+    const slashPrefix = slashCompletionPrefix(next);
+    const exactCommands = slashPrefix === undefined ? [] : slashRegistry.candidates(slashPrefix);
+    const commands = slashPrefix === undefined || exactCommands.length === 1
+      ? []
+      : uniqueCompletionCommands(slashRegistry.complete(slashPrefix));
+    setCompletion(commands.length > 0 ? { commands, index: 0 } : undefined);
   };
   const completeComposer = (command: SlashCommand): void => {
     const firstWhitespace = composerRef.current.text.search(/\s/u);
@@ -465,23 +502,32 @@ function Shell({
       if (key.escape) {
         setCompletion(undefined);
         return;
-      } else if (key.upArrow) setCompletion({
-        ...completion,
-        index: (completion.index - 1 + completion.commands.length) % completion.commands.length,
-      });
-      else if (key.downArrow || key.tab) setCompletion({
-        ...completion,
-        index: (completion.index + 1) % completion.commands.length,
-      });
+      } else if (key.upArrow) {
+        setCompletion({
+          ...completion,
+          index: (completion.index - 1 + completion.commands.length) % completion.commands.length,
+        });
+        return;
+      }
+      else if (key.downArrow || key.tab) {
+        setCompletion({
+          ...completion,
+          index: (completion.index + 1) % completion.commands.length,
+        });
+        return;
+      }
       else if (key.return) {
         completeComposer(completion.commands[completion.index]!);
         setCompletion(undefined);
+        return;
       } else {
         setCompletion(undefined);
-        // Continue below so the key that dismissed the menu still edits the Composer.
-        return void (input && editComposer({ type: "insert", text: input }));
+        if (input) {
+          editComposer({ type: "insert", text: input });
+          return;
+        }
+        // Continue below so editing keys such as Backspace still reach the Composer.
       }
-      return;
     }
     if (session.pendingApproval) {
       const keyInput = input.toLowerCase();
@@ -547,6 +593,7 @@ function Shell({
       const slash = new UserInputRouter(slashRegistry, () => ({
         runActive: controller.getSnapshot().runStatus === "running",
         enterPlanMode: () => controllerResult(controller.enterPlanMode(), "/plan"),
+        enterExecuteMode: () => controllerResult(controller.enterExecuteMode(), "/execute"),
         executeActivePlan: async () => runtime
           ? runtimeCommandToSlash(await runtime.execute({ kind: "plan.execute" }), setLocalConfirmation, dispatch, "/do")
           : controllerResult(controller.executeActivePlan(), "/do"),
@@ -560,6 +607,7 @@ function Shell({
         status: async () => {
           const base = formatStatus({
             workspace,
+            model: currentModel?.() ?? model,
             session: controller.getSnapshot(),
             state,
             toolNames,
@@ -569,6 +617,7 @@ function Shell({
           if (!runtime) return `${base}\nContinuity: unavailable`;
           return `${base}\n${formatRuntimeQuery(await runtime.inspect({ kind: "runtime.status" }))}`;
         },
+        ...(provider ? { provider } : {}),
         permission: () => {
           const snapshot = controller.getSnapshot();
           return {
@@ -728,17 +777,32 @@ function Shell({
     : state.transcript;
   return (
     <Box flexDirection="row" width={columns} height={rows} overflow="hidden" alignItems="stretch">
-      <Box flexDirection="column" flexGrow={1} height={rows} minWidth={0} overflow="hidden">
-        <Text bold color={TUI_COLORS.brand}>Nekoder <Text dimColor>· {sanitizeTerminalText(workspace)}</Text></Text>
+      <Box
+        flexDirection="column"
+        width={mainContentWidth}
+        height={rows}
+        minWidth={0}
+        flexShrink={0}
+        overflow="hidden"
+      >
+        <Text bold color={TUI_COLORS.brand}>{plainIcons ? "*" : "◆"} Nekoder <Text dimColor>· {sanitizeTerminalText(workspace)}</Text></Text>
         <Box flexDirection="column" flexGrow={1} flexShrink={1} overflowY="hidden" justifyContent="flex-end">
-          {visibleTranscript.map((item, index) => (
-            <TranscriptLine
-              key={item.id}
-              item={item}
-              plainIcons={plainIcons}
-              selected={state.focus === "browse" && state.selectedTranscriptIndex === visibleStart + index}
-            />
-          ))}
+          {/*
+            Wrap every visible item in a single inner column. Ink 只能对「单个」
+            超高子节点从顶部裁剪并把尾部钉在底部；当 flex-end 容器直接挂多个总高
+            溢出的子节点时会退化为顶对齐，导致最新内容溢出到底部被状态栏遮挡。
+            用一个内层 Box 把它们收敛成单一子节点即可恢复正确的置底裁剪行为。
+          */}
+          <Box flexDirection="column" flexShrink={0}>
+            {visibleTranscript.map((item, index) => (
+              <TranscriptLine
+                key={item.id}
+                item={item}
+                plainIcons={plainIcons}
+                selected={state.focus === "browse" && state.selectedTranscriptIndex === visibleStart + index}
+              />
+            ))}
+          </Box>
         </Box>
         <Box flexDirection="column" flexShrink={0}>
           <ApprovalCard
@@ -784,9 +848,22 @@ function Shell({
           </Text>
         </Box>
       </Box>
-      {columns >= 120 && <NekoSidebar session={session} state={state} debug={debug} screenReader={screenReader} tasks={tasks} />}
+      {showSidebar && <Box width={SIDEBAR_GAP} flexShrink={0} />}
+      {showSidebar && <NekoSidebar session={session} state={state} model={currentModel?.() ?? model} contextUsage={contextStats} debug={debug} screenReader={screenReader} tasks={tasks} />}
     </Box>
   );
+}
+
+function compactTokenCount(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}m`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(value >= 100_000 ? 0 : 1)}k`;
+  return Math.max(0, Math.round(value)).toString();
+}
+
+function contextProgressBar(ratio: number): string {
+  const width = 12;
+  const filled = Math.round(Math.max(0, Math.min(1, ratio)) * width);
+  return `[${"#".repeat(filled)}${"-".repeat(width - filled)}]`;
 }
 
 function localPersistentDecision(
@@ -886,6 +963,7 @@ function effectivePermission(base: PermissionMode, taskMode: TaskMode): Permissi
 
 function formatStatus(options: {
   readonly workspace: string;
+  readonly model?: string;
   readonly session: SessionSnapshot;
   readonly state: ReturnType<typeof createTuiState>;
   readonly toolNames: readonly string[];
@@ -903,6 +981,7 @@ function formatStatus(options: {
         `${item.server}: ${item.status}, tools ${item.registeredTools}/${item.discoveredTools}${item.restartRequired ? ", restart required" : ""}`
       ).join("\n  ");
   return [
+    `Model: ${options.model ?? "unknown"}`,
     `Task Mode: [${options.session.taskMode.toUpperCase()}]`,
     `Base Permission: ${options.session.permissionMode}`,
     `Effective Permission: ${effectivePermission(options.session.permissionMode, options.session.taskMode)}`,

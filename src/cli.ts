@@ -1,11 +1,12 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline/promises";
 
 import { AgentSession } from "./agent/session.js";
-import { loadConfig, resolveModelLimits, type McpServerConfig } from "./config/config.js";
+import { loadConfig, resolveModelLimits, type McpServerConfig, type ProviderConfig } from "./config/config.js";
 import { AutomationInbox, ConversationManager } from "./conversation/conversation.js";
 import { LLMClient } from "./llm/client.js";
+import { JsonlModelIoHook, withModelIoHook } from "./llm/model-io-hook.js";
 import { buildStableSystemPrompt } from "./prompt/assembler.js";
 import { collectPromptEnvironment } from "./prompt/environment.js";
 import { loadWorkspaceSecurity } from "./security/runtime.js";
@@ -36,13 +37,14 @@ import { DefinitionCatalog } from "./extensions/definition-catalog.js";
 import { SkillRun } from "./extensions/skill-run.js";
 import { HookEngine } from "./extensions/hook-engine.js";
 import { DelegatedTaskManager, type DelegatedTaskExecutor } from "./extensions/delegated-task-manager.js";
-import { TaskTools } from "./extensions/task-tools.js";
+import { inheritParentToolsForSubagent, TaskTools } from "./extensions/task-tools.js";
 import { WorktreeManager } from "./extensions/worktree-manager.js";
-import { HookContentTrustStore, SkillCodeTrustStore } from "./extensions/content-trust.js";
+import { SkillCodeTrustStore } from "./extensions/content-trust.js";
 import { SkillInstaller, type SkillInstallCandidate } from "./extensions/skill-installer.js";
 import { grantedSecretEnvironment, requestTaskSecretGrants } from "./extensions/task-secret-grant.js";
 import { createBuiltinSlashRegistry } from "./slash/builtins.js";
-import type { SlashCommand, SlashRegistry } from "./slash/registry.js";
+import type { ProviderSlashAction, SlashCommand, SlashCommandResult, SlashRegistry } from "./slash/registry.js";
+import type { ModelInvoker } from "./model/types.js";
 
 export interface CliOptions {
   readonly demo: boolean;
@@ -100,6 +102,10 @@ export async function runCli(
   const workspace = process.cwd();
   let configured: {
     readonly controller: SessionController;
+    readonly model?: string;
+    readonly currentModel?: () => string;
+    readonly contextUsage?: () => { readonly used: number; readonly total: number };
+    readonly provider?: (action: ProviderSlashAction) => Promise<SlashCommandResult>;
     readonly toolNames?: readonly string[];
     readonly permissionSources?: readonly string[];
     readonly mcpDiagnostics?: () => ReturnType<McpManager["diagnostics"]>;
@@ -115,7 +121,7 @@ export async function runCli(
   try {
     if (options.demo) {
       const demo = createDemoApplication(workspace);
-      configured = { controller: demo.controller, async dispose() {} };
+      configured = { controller: demo.controller, model: "demo", async dispose() {} };
     } else {
       configured = await createConfiguredApplication(workspace, io);
     }
@@ -128,6 +134,10 @@ export async function runCli(
     ...io,
     workspace,
     taskMode: "execute",
+    model: configured.model,
+    currentModel: configured.currentModel,
+    contextUsage: configured.contextUsage,
+    provider: configured.provider,
     controller: configured.controller,
     debug: options.debug,
     plainIcons: options.plainIcons,
@@ -162,6 +172,10 @@ async function createConfiguredApplication(
   io: { readonly stdin: NodeJS.ReadStream; readonly stdout: NodeJS.WriteStream }
 ): Promise<{
   readonly controller: SessionController;
+  readonly model: string;
+  readonly currentModel: () => string;
+  readonly contextUsage: () => { readonly used: number; readonly total: number };
+  readonly provider: (action: ProviderSlashAction) => Promise<SlashCommandResult>;
   readonly toolNames: readonly string[];
   readonly permissionSources: readonly string[];
   readonly mcpDiagnostics: () => ReturnType<McpManager["diagnostics"]>;
@@ -176,21 +190,31 @@ async function createConfiguredApplication(
 }> {
   const config = loadConfig(workspace);
   const security = loadWorkspaceSecurity(workspace);
-  const provider = config.providers[0];
-  if (!provider) throw new Error("No model provider is configured");
-  const limits = await resolveModelLimits(provider);
-  const model = new LLMClient(
-    provider,
-    buildStableSystemPrompt(),
-    limits
-  );
+  let activeProvider = config.providers[0];
+  if (!activeProvider) throw new Error("No model provider is configured");
+  const initialLimits = await resolveModelLimits(activeProvider);
+  const stableSystemPrompt = buildStableSystemPrompt();
+  const configuredLogPath = config.llm_io_hook?.path ?? join(".nekoder", "logs", "llm-io.jsonl");
+  const modelIoHook = config.llm_io_hook?.enabled
+    ? new JsonlModelIoHook({
+        file: isAbsolute(configuredLogPath) ? configuredLogPath : resolve(workspace, configuredLogPath),
+        stableSystemPrompt,
+      })
+    : undefined;
+  const createModel = (provider: ProviderConfig, limits: Awaited<ReturnType<typeof resolveModelLimits>>): ModelInvoker => {
+    const client = new LLMClient(provider, stableSystemPrompt, limits);
+    return modelIoHook ? withModelIoHook(client, modelIoHook) : client;
+  };
+  let activeModel = createModel(activeProvider, initialLimits);
+  const model: ModelInvoker = {
+    collect: (request) => activeModel.collect(request),
+  };
   const conversation = new ConversationManager();
   const automationInbox = new AutomationInbox();
   const journal = new SessionJournal({ root: join(workspace, ".nekoder", "sessions") });
   const definitionCatalog = new DefinitionCatalog({ workspace, homeDir: homedir() });
   let definitions = await definitionCatalog.load();
-  const hookTrust = new HookContentTrustStore(homedir());
-  let effectiveHooks = await authorizeInitialProjectHooks(workspace, definitions.hooks, hookTrust, io);
+  let effectiveHooks = definitions.hooks;
   const slashRegistry = createBuiltinSlashRegistry();
   const refreshSkillSlash = (): void => slashRegistry.replaceDynamic(definitions.skills
     .filter((skill) => skill.frontmatter["user-invocable"] !== false)
@@ -242,11 +266,7 @@ async function createConfiguredApplication(
     const childRegistry = new ToolRegistry();
     const allowed = definition.tools ? new Set(definition.tools) : undefined;
     const denied = new Set([...definition.disallowedTools, "delegate_agent", "task_list", "task_cancel"]);
-    for (const { name } of registry.definitions()) {
-      if (name === "use_skill" || name === "run_command" || denied.has(name) || (task.kind === "defined" && name.startsWith("skill__")) || (allowed && !allowed.has(name))) continue;
-      const candidate = registry.get(name);
-      if (candidate) childRegistry.register(candidate);
-    }
+    inheritParentToolsForSubagent(registry, childRegistry, { kind: task.kind, allowed, denied });
     if ((!allowed || allowed.has("run_command")) && !denied.has("run_command")) childRegistry.register(createRunCommandTool({
       envPassthroughProvider: () => [...grantedSecrets],
       ...(config.tools.run_command?.shell ? { shell: config.tools.run_command.shell } : {}),
@@ -281,7 +301,7 @@ async function createConfiguredApplication(
         customInstructions: `${definition.instructions}${definition.secrets.length ? `\n\nAvailable Task Secret names: ${definition.secrets.join(", ")}. Request only those needed through task_update.request_secrets; values are never visible to you and become available only inside approved host execution.` : ""}`,
         ...(taskContext.inheritedSkills ? { skills: taskContext.inheritedSkills } : {}),
         longTermMemory: memory.snapshot().injectionText,
-        environment: collectPromptEnvironment(childWorkspace, { model: provider.model, shell: config.tools.run_command?.shell?.kind ?? (process.platform === "win32" ? "powershell" : "sh") }),
+        environment: collectPromptEnvironment(childWorkspace, { model: activeProvider.model, shell: config.tools.run_command?.shell?.kind ?? (process.platform === "win32" ? "powershell" : "sh") }),
       },
       continuity: {
         prepareModelCall: async (messages) => ({
@@ -322,8 +342,15 @@ async function createConfiguredApplication(
     },
   });
   const hookEngine = new HookEngine(effectiveHooks, {
-    createTask: async ({ agent, task }) => (await taskManager.create({ caller: "trusted_root_hook", kind: "defined", agent, prompt: task, mode: "background" })).id,
+    createTask: async ({ agent, task }) => (await taskManager.create({ caller: "hook", kind: "defined", agent, prompt: task, mode: "background" })).id,
   });
+  const dispatchLifecycleHook = async (event: import("./extensions/hook-engine.js").HookEvent): Promise<void> => {
+    const result = await hookEngine.handle(event);
+    for (const message of result.messages) automationInbox.add({ origin: "hook", id: message.hookId, content: message.content });
+    for (const diagnostic of result.diagnostics) {
+      automationInbox.add({ origin: "hook", id: diagnostic.hookId, content: `Hook diagnostic (${diagnostic.code}): ${diagnostic.message}` });
+    }
+  };
   registry = new ToolRegistry();
   registerCoreTools(registry, {
     skipDirs: config.tools.skip_dirs,
@@ -370,9 +397,10 @@ async function createConfiguredApplication(
     },
   });
   registry.register(skillRun.tool());
-  for (const tool of new TaskTools(taskManager, {
+  const rootTaskTools = (): readonly import("./tools/types.js").AnyTool[] => new TaskTools(taskManager, {
     forkHistoryProvider: () => conversation.getMessages(),
     inheritedSkillsProvider: () => skillRun.supplementalInstructions(),
+    agentDefinitions: definitions.agents,
     resolveIsolation: (agent, requested, kind) => {
       if (kind === "fork") return requested ?? "shared";
       const definition = definitions.agent(agent ?? "general");
@@ -381,13 +409,14 @@ async function createConfiguredApplication(
       if (!definition.isolation.includes(isolation)) throw new Error(`Agent ${definition.name} does not allow ${isolation} isolation`);
       return isolation;
     },
-  }).root()) registry.register(tool);
+  }).root();
   registry.seal();
+  registry.registerDynamic("root-task-tools", rootTaskTools());
   approvalBroker = new ApprovalBroker();
   const shell = config.tools.run_command?.shell?.kind
     ?? (process.platform === "win32" ? "powershell" : "sh");
   const environment = () => collectPromptEnvironment(workspace, {
-    model: provider.model,
+    model: activeProvider.model,
     shell,
   });
   runner = new ToolRunner(registry, {
@@ -426,13 +455,16 @@ async function createConfiguredApplication(
   });
   const instructions = new InstructionLoader({ workspace, homeDir: homedir() });
   const artifacts = new ToolArtifactStore(workspace);
-  const counter = new TokenCounter({ contextWindow: limits.contextWindow });
+  let activeCounter = new TokenCounter({ contextWindow: initialLimits.contextWindow });
+  const counter = {
+    budget: (input: Parameters<TokenCounter["budget"]>[0]) => activeCounter.budget(input),
+  };
   const compactor = new ContextCompactor({
     conversation,
     model,
     counter,
     tools: () => registry.definitions(),
-    onCompacted: async (result) => {
+    onCompacted: async (result, manual) => {
       const current = await journal.current();
       if (!current) return;
       const lastSeq = Math.max(...current.events.map(({ seq }) => seq));
@@ -444,6 +476,24 @@ async function createConfiguredApplication(
         interactionCount: result.interactionCount,
         beforeTokens: result.before.requiredTokens,
         afterTokens: result.after.requiredTokens,
+      });
+      await dispatchLifecycleHook({
+        type: "context_compact",
+        session: { id: current.projection.id },
+        compaction: {
+          manual,
+          outcome: "compacted",
+          before_tokens: result.before.requiredTokens,
+          after_tokens: result.after.requiredTokens,
+        },
+      });
+    },
+    onError: async (error) => {
+      const current = await journal.current();
+      await dispatchLifecycleHook({
+        type: "system_error",
+        ...(current ? { session: { id: current.projection.id } } : {}),
+        error: { source: "context_compact", message: error.message, code: error.code },
       });
     },
   });
@@ -488,15 +538,18 @@ async function createConfiguredApplication(
     compactor,
     artifacts,
     memoryJobs,
+    onLifecycle: dispatchLifecycleHook,
     prepareRun: async () => {
       const next = await definitionCatalog.load();
       definitions = next;
-      effectiveHooks = await trustedHooks(workspace, next.hooks, hookTrust);
+      effectiveHooks = next.hooks;
       refreshSkillSlash();
       skillRun.reload(next);
       hookEngine.reload(effectiveHooks);
+      registry.registerDynamic("root-task-tools", rootTaskTools());
     },
   });
+  await dispatchLifecycleHook({ type: "system_start", system: { workspace } });
   await runtime.initialize();
   for (const event of (await journal.current())?.events ?? []) {
     if (event.type === "delegated_task") taskManager.restoreTerminal(event.task);
@@ -504,8 +557,60 @@ async function createConfiguredApplication(
   const mcpDiagnostics = mcpManager.diagnostics();
   const connectedMcp = mcpDiagnostics.filter(({ status }) => status === "connected").length;
   const unavailableMcp = mcpDiagnostics.length - connectedMcp;
+  const providerCommand = async (action: ProviderSlashAction): Promise<SlashCommandResult> => {
+    if (action.kind === "list") {
+      return {
+        kind: "info",
+        message: config.providers.map((item) =>
+          `${item === activeProvider ? "*" : " "} ${item.name} · ${item.protocol} · ${item.model}`
+        ).join("\n"),
+      };
+    }
+    const delegatedRunActive = taskManager.list().some(({ status }) =>
+      !["completed", "failed", "cancelled", "interrupted"].includes(status)
+    );
+    if (delegatedRunActive) {
+      return {
+        kind: "blocked",
+        code: "run_active",
+        message: "Cannot switch Provider while a delegated Agent task is active",
+      };
+    }
+    const nextProvider = config.providers.find(({ name }) => name === action.name);
+    if (!nextProvider) {
+      return {
+        kind: "blocked",
+        code: "not_found",
+        message: `Unknown Provider: ${action.name}. Configured Providers: ${config.providers.map(({ name }) => name).join(", ")}`,
+      };
+    }
+    if (nextProvider === activeProvider) {
+      return { kind: "success", message: `Provider ${nextProvider.name} is already active (${nextProvider.model})` };
+    }
+    try {
+      const nextLimits = await resolveModelLimits(nextProvider);
+      const nextModel = createModel(nextProvider, nextLimits);
+      activeProvider = nextProvider;
+      activeModel = nextModel;
+      activeCounter = new TokenCounter({ contextWindow: nextLimits.contextWindow });
+      return { kind: "success", message: `Switched Provider to ${nextProvider.name} (${nextProvider.model}) for this process` };
+    } catch (error) {
+      return {
+        kind: "blocked",
+        code: "operation_failed",
+        message: `Unable to switch Provider to ${nextProvider.name}: ${String(error)}`,
+      };
+    }
+  };
   return {
     controller,
+    model: activeProvider.model,
+    currentModel: () => activeProvider.model,
+    contextUsage: () => {
+      const status = compactor.status();
+      return { used: status.currentTokens, total: status.contextWindow };
+    },
+    provider: providerCommand,
     runtime,
     tasks: () => taskManager.list(),
     moveTaskToBackground: (taskId) => { taskManager.moveToBackground(taskId); },
@@ -524,6 +629,8 @@ async function createConfiguredApplication(
       ? []
       : [`MCP startup: ${connectedMcp} connected, ${unavailableMcp} unavailable or skipped. Use /status for details.`],
     dispose: async () => {
+      await runtime.close("system_exit");
+      await dispatchLifecycleHook({ type: "system_exit", system: { workspace, reason: "user_exit" } });
       await taskManager.shutdown();
       await mcpManager.close();
     },
@@ -540,38 +647,6 @@ function narrowPermissionMode(
     strict: 0, plan: 0, default: 1, acceptEdit: 2, permissive: 3,
   };
   return rank[requested] <= rank[root] ? requested : root;
-}
-
-async function trustedHooks(
-  workspace: string,
-  hooks: readonly import("./extensions/hook-engine.js").HookRule[],
-  store: HookContentTrustStore
-): Promise<readonly import("./extensions/hook-engine.js").HookRule[]> {
-  return Promise.all(hooks.map(async (hook) => Object.freeze({
-    ...hook,
-    trusted: hook.trusted === true || await store.isTrusted(workspace, hook),
-  })));
-}
-
-async function authorizeInitialProjectHooks(
-  workspace: string,
-  hooks: readonly import("./extensions/hook-engine.js").HookRule[],
-  store: HookContentTrustStore,
-  io: { readonly stdin: NodeJS.ReadStream; readonly stdout: NodeJS.WriteStream }
-): Promise<readonly import("./extensions/hook-engine.js").HookRule[]> {
-  const pending = hooks.filter((hook) => hook.source === "project" && !("deny" in hook.action) && hook.trusted !== true);
-  if (pending.length === 0) return trustedHooks(workspace, hooks, store);
-  const readline = createInterface({ input: io.stdin, output: io.stdout });
-  try {
-    for (const hook of pending) {
-      if (await store.isTrusted(workspace, hook)) continue;
-      const answer = await readline.question(`Project Hook ${hook.id} (${hook.path}) can inject automation content or create a SubAgent. Trust content ${hook.contentHash?.slice(0, 12)}? [y/N] `);
-      if (/^(?:y|yes)$/iu.test(answer.trim())) await store.trust(workspace, hook);
-    }
-  } finally {
-    readline.close();
-  }
-  return trustedHooks(workspace, hooks, store);
 }
 
 function formatMcpTrustPrompt(

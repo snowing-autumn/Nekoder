@@ -145,6 +145,17 @@ export class AgentSession {
         emit,
         startedAt
       );
+      if (this.dependencies.hookEngine && outcome.status !== "completed" && outcome.status !== "cancelled") {
+        await this.applyHooks({
+          type: "system_error",
+          run: { id: agentRunId, agent: this.dependencies.agentKind ?? "root" },
+          error: {
+            source: "agent_run",
+            message: "message" in outcome ? outcome.message : "reason" in outcome ? outcome.reason : "Agent run failed",
+            code: outcome.status,
+          },
+        });
+      }
       this.drainAutomationInbox();
       if (this.dependencies.hookEngine) await this.applyHooks({ type: "run_finish", run: { id: agentRunId, agent: this.dependencies.agentKind ?? "root" } });
       await emit("run_finished", outcome);
@@ -403,7 +414,7 @@ export class AgentSession {
           ...this.systemInstructions(
             taskMode,
             this.nextModelCallNumber(prepared.resetPromptCounter),
-            boundedFinalizationInstructions(stopReason)
+            boundedFinalizationInstructions(stopReason, taskMode)
           ),
           ...(prepared.supplementalInstructions ?? []),
         ],
@@ -411,16 +422,35 @@ export class AgentSession {
         signal,
         onTextDelta: (delta) => emit("text_delta", { finalization: true, delta }),
       });
+      if (taskMode === "plan" && !isNormalFinalization(finalization)) {
+        finalization = await this.dependencies.model.collect({
+          messages: [
+            ...prepared.messages,
+            {
+              role: "user",
+              content: "The investigation budget is exhausted. Do not request or imitate any tool call. Respond now with only the final actionable implementation plan based on the evidence already collected.",
+            },
+          ],
+          tools: [],
+          systemInstructions: [
+            ...this.systemInstructions(
+              taskMode,
+              this.nextModelCallNumber(),
+              boundedFinalizationInstructions(stopReason, taskMode)
+            ),
+            ...(prepared.supplementalInstructions ?? []),
+          ],
+          toolChoice: "none",
+          signal,
+          onTextDelta: (delta) => emit("text_delta", { finalization: true, delta }),
+        });
+      }
     } catch (error) {
       if (signal.aborted) return finish({ status: "cancelled" }, stepsCompleted);
       return finish({ status: "finalization_failed", message: String(error) }, stepsCompleted);
     }
     if (signal.aborted) return finish({ status: "cancelled" }, stepsCompleted);
-    if (
-      finalization.finishReason !== "stop" ||
-      finalization.toolCalls.length > 0 ||
-      !finalization.text.trim()
-    ) {
+    if (!isNormalFinalization(finalization)) {
       return finish({ status: "finalization_failed", message: "Bounded finalization did not produce a normal non-empty response" }, stepsCompleted);
     }
     this.dependencies.conversation.addMessages(finalization.responseMessages);
@@ -432,6 +462,22 @@ export class AgentSession {
         total: { ...usage },
         finalization: true,
       });
+    }
+    if (taskMode === "plan") {
+      const activePlanId = this.dependencies.idFactory?.() ?? crypto.randomUUID();
+      this.activePlan = {
+        id: activePlanId,
+        originalGoal: this.pendingUserGoal,
+        text: finalization.text,
+        createdAt: this.now(),
+      };
+      const outcome = finish({
+        status: "completed",
+        finalText: finalization.text,
+        activePlanId,
+      }, stepsCompleted);
+      await this.dependencies.continuity?.scheduleMemoryUpdate?.(outcome);
+      return outcome;
     }
     return finish(
       { status: "stopped", reason: stopReason, finalizationText: finalization.text },
@@ -500,8 +546,20 @@ function visibleTools(registry: ToolRegistry, mode: TaskMode) {
     : definitions.filter(({ name }) => ["read_file", "find_files", "search_text", "run_command"].includes(name));
 }
 
-function boundedFinalizationInstructions(reason: "step_limit_reached" | "unknown_tool_loop" | "permission_denial_loop" | "hook_denial_loop"): string {
+function boundedFinalizationInstructions(
+  reason: "step_limit_reached" | "unknown_tool_loop" | "permission_denial_loop" | "hook_denial_loop",
+  taskMode: TaskMode
+): string {
+  if (taskMode === "plan") {
+    return `Do not use or imitate tool calls. Stop investigating because ${reason}. Based only on the evidence already collected, produce the best actionable implementation plan now. Include intended changes, important constraints, and verification. Output only the plan; do not claim implementation is complete.`;
+  }
   return `Do not use tools. The run stopped because ${reason}. State the stop reason, completed work, unfinished work, and recommended next step.`;
+}
+
+function isNormalFinalization(result: import("../model/types.js").ModelStepResult): boolean {
+  return result.finishReason === "stop"
+    && result.toolCalls.length === 0
+    && Boolean(result.text.trim());
 }
 
 function hookDenialIdentity(results: readonly import("../tools/runner.js").ToolCallResult[]): string | undefined {

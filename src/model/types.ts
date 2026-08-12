@@ -46,6 +46,12 @@ export interface ModelCollectRequest {
   readonly tools: readonly ModelToolDefinition[];
   readonly instructions?: string;
   readonly systemInstructions?: readonly string[];
+  /**
+   * When true, omit the coding-agent stable system prompt and use only
+   * request.systemInstructions / instructions. Used by specialized jobs
+   * (Memory maintenance) that must not inherit tool/coding behavior.
+   */
+  readonly omitStableSystemPrompt?: boolean;
   readonly toolChoice?: "auto" | "none";
   readonly signal?: AbortSignal;
   readonly onTextDelta?: (delta: string) => void | Promise<void>;

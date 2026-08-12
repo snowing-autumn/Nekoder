@@ -300,7 +300,7 @@ export function reduceTuiState(state: TuiState, event: AgentEvent): TuiState {
     case "approval_requested":
       return { ...state, runVisualState: "awaiting_approval", focus: "approval" };
     case "approval_resolved":
-      return { ...state, runVisualState: "executing_tool", focus: "browse" };
+      return { ...state, runVisualState: "executing_tool", focus: "compose" };
     case "usage":
       return {
         ...state,

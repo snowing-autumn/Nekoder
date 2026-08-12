@@ -6,7 +6,7 @@ export type DelegatedTaskStatus =
 export type DelegatedTaskTerminalStatus = "completed" | "failed" | "cancelled" | "interrupted";
 
 export interface DelegatedTaskRequest {
-  readonly caller: "root" | "trusted_root_hook" | "subagent";
+  readonly caller: "root" | "hook" | "subagent";
   readonly kind: "defined" | "fork";
   readonly agent?: string;
   readonly prompt: string;
@@ -101,7 +101,7 @@ export class DelegatedTaskManager {
 
   async create(request: DelegatedTaskRequest): Promise<DelegatedTask> {
     if (this.closed) throw new Error("Delegated Task Manager is closed");
-    if (request.caller !== "root" && request.caller !== "trusted_root_hook") throw new Error("Only Root Agent or a trusted Root Hook may create a SubAgent");
+    if (request.caller !== "root" && request.caller !== "hook") throw new Error("Only Root Agent or a Hook may create a SubAgent");
     if (request.kind === "defined" && !request.agent) throw new Error("Defined delegation requires an agent name");
     const capacity = this.options.maxRunning ?? 5;
     if (this.running.size >= capacity && this.queue.length >= (this.options.maxQueued ?? 20)) throw new Error("Delegated Task queue is full");

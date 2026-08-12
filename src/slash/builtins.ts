@@ -82,6 +82,14 @@ export function createBuiltinSlashRegistry(): SlashRegistry {
       },
     },
     {
+      name: "execute", aliases: ["exec"], description: "Exit Plan Mode without executing a Plan", usage: "/execute",
+      destination: "local", allowDuringRun: false,
+      async handle(context, args) {
+        if (args) return usage("/execute does not accept arguments", "/execute");
+        return await context.enterExecuteMode();
+      },
+    },
+    {
       name: "do", aliases: [], description: "Execute the active Plan", usage: "/do",
       destination: "local", allowDuringRun: false,
       async handle(context, args) {
@@ -185,6 +193,17 @@ export function createBuiltinSlashRegistry(): SlashRegistry {
         const parts = words(args); const project = parts.at(-1) === "--project"; if (project) parts.pop();
         if (parts.length < 1) return usage("Invalid /skill-create arguments", "/skill-create <name> [description] [--project]");
         const name = parts.shift()!; return context.skillCreate(name, parts.join(" ") || `Use ${name}`, project);
+      },
+    },
+    {
+      name: "provider", aliases: ["model"], description: "Show or switch the active model Provider",
+      usage: "/provider [name]", argumentHint: "provider-name", destination: "local", allowDuringRun: false,
+      async handle(context, args) {
+        if (!context.provider) return unavailableResult("provider");
+        const parts = words(args);
+        if (parts.length === 0) return await context.provider({ kind: "list" });
+        if (parts.length !== 1) return usage("Invalid /provider arguments", "/provider [name]");
+        return await context.provider({ kind: "switch", name: parts[0]! });
       },
     },
     {

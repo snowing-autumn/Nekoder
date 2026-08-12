@@ -80,6 +80,12 @@ export class SessionController {
     return { ok: true, action: "mode_changed", taskMode: "plan" };
   }
 
+  enterExecuteMode(): ControllerResult {
+    if (this.activeHandle) return runActiveResult();
+    this.setSnapshot({ ...this.snapshot, taskMode: "execute", activePlanId: undefined });
+    return { ok: true, action: "mode_changed", taskMode: "execute" };
+  }
+
   executeActivePlan(): ControllerResult {
     if (this.activeHandle) return runActiveResult();
     if (!this.snapshot.activePlanId) {
@@ -134,10 +140,13 @@ export class SessionController {
   private track(handle: AgentRunHandle): void {
     this.activeHandle = handle;
     const task = (async () => {
+      let terminalEvent: Extract<AgentEvent, { readonly type: "run_finished" }> | undefined;
       for await (const event of handle.events) {
-        for (const listener of this.eventListeners) listener(event);
+        if (event.type === "run_finished") terminalEvent = event;
+        else for (const listener of this.eventListeners) listener(event);
       }
       const outcome = await handle.result;
+      if (this.activeHandle === handle) this.activeHandle = undefined;
       this.setSnapshot({
         permissionMode: this.snapshot.permissionMode,
         taskMode: this.snapshot.taskMode,
@@ -146,8 +155,11 @@ export class SessionController {
           ? { activePlanId: outcome.activePlanId }
           : {}),
       });
+      if (terminalEvent) {
+        for (const listener of this.eventListeners) listener(terminalEvent);
+      }
     })().finally(() => {
-      this.activeHandle = undefined;
+      if (this.activeHandle === handle) this.activeHandle = undefined;
       if (this.activeTask === task) this.activeTask = undefined;
     });
     this.activeTask = task;

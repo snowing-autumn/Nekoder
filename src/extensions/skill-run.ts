@@ -155,14 +155,14 @@ export class SkillRun {
   tool(): Tool<UseSkillInput, UseSkillInput, unknown> {
     return {
       name: "use_skill",
-      description: "Activate a discovered Skill for this Run. This orchestration tool must be the only call in its Tool Batch.",
+      description: "Activate a discovered Skill workflow. This is not a general SubAgent launcher; use delegate_agent when the user asks to start a SubAgent. This orchestration tool must be the only call in its Tool Batch.",
       effect: "read",
       inputSchema: {
         type: "object",
         properties: {
           name: { type: "string", minLength: 1 },
           arguments: { type: "string" },
-          mode: { type: "string", enum: ["inline", "delegated"] },
+          mode: { type: "string", enum: ["inline", "delegated"], description: "inline adds this Skill's instructions to the current Run; delegated runs this specific Skill workflow as a delegated task, not as a general-purpose SubAgent request." },
         },
         required: ["name"],
         additionalProperties: false,

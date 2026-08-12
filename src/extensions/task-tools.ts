@@ -1,11 +1,38 @@
 import type { DelegatedTaskManager } from "./delegated-task-manager.js";
 import type { AnyTool, Tool, ToolResult } from "../tools/types.js";
+import type { ToolRegistry } from "../tools/registry.js";
 import type { ConversationMessage } from "../conversation/conversation.js";
+
+const ROOT_TASK_TOOL_NAMES = new Set(["delegate_agent", "task_list", "task_get", "task_cancel"]);
+
+export function inheritParentToolsForSubagent(
+  parent: ToolRegistry,
+  child: ToolRegistry,
+  options: {
+    readonly kind: "defined" | "fork";
+    readonly allowed?: ReadonlySet<string>;
+    readonly denied?: ReadonlySet<string>;
+  }
+): void {
+  for (const { name } of parent.definitions()) {
+    if (
+      name === "use_skill"
+      || name === "run_command"
+      || ROOT_TASK_TOOL_NAMES.has(name)
+      || options.denied?.has(name)
+      || (options.kind === "defined" && name.startsWith("skill__"))
+      || (options.allowed && !options.allowed.has(name))
+    ) continue;
+    const candidate = parent.get(name);
+    if (candidate) child.register(candidate);
+  }
+}
 
 export interface TaskToolsOptions {
   readonly foregroundTimeoutMs?: number;
   readonly forkHistoryProvider?: () => readonly ConversationMessage[];
   readonly inheritedSkillsProvider?: () => readonly string[];
+  readonly agentDefinitions?: readonly { readonly name: string; readonly description: string }[];
   readonly resolveIsolation?: (agent: string | undefined, requested: "shared" | "worktree" | undefined, kind: "defined" | "fork") => "shared" | "worktree";
   readonly requestSecrets?: (names: readonly string[]) => Promise<readonly string[]>;
 }
@@ -22,14 +49,26 @@ export class TaskTools {
   }
 
   private delegate(): Tool<any, any, unknown> {
-    return tool("delegate_agent", "Delegate one bounded task to a one-level SubAgent. Must be exclusive in its Tool Batch.", "execute", {
-      kind: { type: "string", enum: ["defined", "fork"] }, agent: { type: "string" }, prompt: { type: "string", minLength: 1 },
+    const agentDefinitions = this.options.agentDefinitions ?? [];
+    const availableAgents = agentDefinitions
+      .map(({ name, description }) => `${name}: ${description}`)
+      .join("; ");
+    return tool("delegate_agent", "The only tool for starting a general-purpose SubAgent. Delegate one bounded task to a one-level SubAgent; do not use use_skill as a substitute. Must be exclusive in its Tool Batch.", "execute", {
+      kind: { type: "string", enum: ["defined", "fork"], description: "Use defined for a named bounded role, or fork to continue from the Root conversation." },
+      agent: {
+        type: "string",
+        ...(agentDefinitions.length > 0 ? { enum: agentDefinitions.map(({ name }) => name) } : {}),
+        description: agentDefinitions.length > 0
+          ? `Required when kind is defined; omit when kind is fork. Available Agent Definitions: ${availableAgents}`
+          : "Required when kind is defined; omit when kind is fork.",
+      },
+      prompt: { type: "string", minLength: 1 },
       mode: { type: "string", enum: ["foreground", "background"] }, isolation: { type: "string", enum: ["shared", "worktree"] },
     }, ["kind", "prompt"], async (input, context) => {
       try {
         const isolation = this.options.resolveIsolation?.(input.agent, input.isolation, input.kind) ?? input.isolation;
         const task = await this.manager.create({
-          caller: "root", kind: input.kind, agent: input.agent, prompt: input.prompt, mode: input.mode, isolation,
+          caller: "root", kind: input.kind, agent: input.kind === "defined" ? input.agent : undefined, prompt: input.prompt, mode: input.mode, isolation,
           ...(input.kind === "fork" && this.options.forkHistoryProvider ? { forkHistory: safeForkHistory(this.options.forkHistoryProvider()) } : {}),
           ...(input.kind === "fork" && this.options.inheritedSkillsProvider ? { inheritedSkills: this.options.inheritedSkillsProvider() } : {}),
         });
@@ -39,14 +78,19 @@ export class TaskTools {
         let timer: ReturnType<typeof setTimeout> | undefined;
         const completed = await Promise.race([
           this.manager.wait(task.id).then((value) => ({ value, timedOut: false as const })),
-          new Promise<{ timedOut: true }>((resolve) => { timer = setTimeout(() => resolve({ timedOut: true }), timeout); timer.unref?.(); }),
+          new Promise<{ timedOut: true }>((resolve) => { timer = setTimeout(() => resolve({ timedOut: true }), timeout); }),
         ]);
         if (timer) clearTimeout(timer);
-        return completed.timedOut
-          ? success({ ...this.manager.get(task.id), background: true, reason: "foreground_timeout" })
-          : success({ ...completed.value, background: false });
+        if (completed.timedOut) {
+          const backgroundTask = this.manager.moveToBackground(task.id);
+          return success({ ...backgroundTask, background: true, reason: "foreground_timeout" });
+        }
+        return success({ ...completed.value, background: false });
       } catch (error) { return failure("task_creation_failed", String(error)); }
-    });
+    }, [{
+      if: { properties: { kind: { const: "defined" } }, required: ["kind"] },
+      then: { properties: { agent: {} }, required: ["agent"] },
+    }]);
   }
 
   private list(): AnyTool {
@@ -89,9 +133,10 @@ export class TaskTools {
 
 function tool(
   name: string, description: string, effect: "read" | "write" | "execute", properties: Record<string, unknown>, required: string[],
-  execute: (input: any, context: import("../tools/types.js").ToolExecutionContext) => Promise<ToolResult<unknown>>
+  execute: (input: any, context: import("../tools/types.js").ToolExecutionContext) => Promise<ToolResult<unknown>>,
+  allOf?: readonly unknown[]
 ): AnyTool {
-  return { name, description, effect, inputSchema: { type: "object", properties, required, additionalProperties: false }, timeoutMs: 35_000,
+  return { name, description, effect, inputSchema: { type: "object", properties, required, additionalProperties: false, ...(allOf ? { allOf } : {}) }, timeoutMs: 35_000,
     async prepare(input) { return { ok: true, data: input }; }, execute } as AnyTool;
 }
 function success(data: unknown): ToolResult<unknown> { return { ok: true, data }; }

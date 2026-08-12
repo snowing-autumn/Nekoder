@@ -12,13 +12,19 @@ export type SlashCommandResult =
       readonly message: string;
     };
 
+export type ProviderSlashAction =
+  | { readonly kind: "list" }
+  | { readonly kind: "switch"; readonly name: string };
+
 export interface SlashCommandContext {
   readonly runActive: boolean;
   enterPlanMode(): SlashCommandResult | Promise<SlashCommandResult>;
+  enterExecuteMode(): SlashCommandResult | Promise<SlashCommandResult>;
   executeActivePlan(): SlashCommandResult | Promise<SlashCommandResult>;
   startPrompt(modelText: string, displayText: string): SlashCommandResult | Promise<SlashCommandResult>;
   clearTranscript(): void;
   status(): string | Promise<string>;
+  provider?(action: ProviderSlashAction): SlashCommandResult | Promise<SlashCommandResult>;
   permission(): { readonly base: string; readonly effective: string; readonly sources: readonly string[] };
   setPermission(mode: "strict" | "plan" | "default" | "acceptEdit" | "permissive"): void;
   confirmPermissive(): SlashCommandResult | Promise<SlashCommandResult>;

@@ -3,12 +3,13 @@ import type { AgentOutcome } from "../agent/types.js";
 import type { ConversationManager } from "../conversation/conversation.js";
 import type { ToolCallResult } from "../tools/runner.js";
 import type { ControllerResult, SessionController } from "../tui/session-controller.js";
-import { ContextCompactor, type CompactionResult } from "./context-compactor.js";
+import { ContextCompactor, ContextCompactorError, type CompactionResult } from "./context-compactor.js";
 import { InstructionLoader, type InstructionSnapshot } from "./instruction-loader.js";
 import { MemoryCatalog, type MemoryFilter, type MemoryNote, type MemoryNoteSummary } from "./memory-catalog.js";
 import type { MemoryJobRunner } from "./memory-job-runner.js";
 import { SessionJournal, type SessionProjection, type SessionSnapshot } from "./session-journal.js";
 import { ToolArtifactStore } from "./tool-artifact-store.js";
+import type { HookEvent } from "../extensions/hook-engine.js";
 
 export type RuntimeCommand =
   | { readonly kind: "plan.execute" }
@@ -60,6 +61,7 @@ export interface WorkspaceRuntimeOptions {
   readonly memoryJobs?: MemoryJobRunner;
   readonly onMemoryUpdate?: (outcome: AgentOutcome) => void | Promise<void>;
   readonly prepareRun?: () => void | Promise<void>;
+  readonly onLifecycle?: (event: HookEvent) => void | Promise<void>;
 }
 
 type PendingConfirmation =
@@ -85,7 +87,9 @@ export class WorkspaceRuntime {
     await this.options.memory.refresh();
     const expired = await this.options.journal.cleanupExpired();
     await Promise.all(expired.map((id) => this.options.artifacts.deleteSessionArtifacts(id)));
-    if (!(await this.options.journal.current())) await this.options.journal.new();
+    let current = await this.options.journal.current();
+    if (!current) current = await this.options.journal.new();
+    await this.options.onLifecycle?.({ type: "session_start", session: { id: current.projection.id, reason: "created" } });
     if (this.options.memoryJobs) {
       const input = this.memoryMaintenanceInput();
       await Promise.allSettled([
@@ -146,9 +150,12 @@ export class WorkspaceRuntime {
           return formatCompaction(await this.options.compactor.compact(true));
         case "session.new": {
           await this.persistConversationTail();
+          const previous = await this.options.journal.current();
+          if (previous) await this.options.onLifecycle?.({ type: "session_end", session: { id: previous.projection.id, reason: "replaced" } });
           const snapshot = await this.options.journal.new(this.options.controller.getSnapshot().taskMode);
           this.options.conversation.replaceMessages([]);
           this.persistedMessages = 0;
+          await this.options.onLifecycle?.({ type: "session_start", session: { id: snapshot.projection.id, reason: "created" } });
           return { kind: "success", message: `Created Session ${snapshot.projection.id}`, clearTimeline: true };
         }
         case "session.resume": {
@@ -157,11 +164,18 @@ export class WorkspaceRuntime {
             .find(({ id }) => id === command.sessionId);
           if (!target) return notFound(`Session not found: ${command.sessionId}`);
           const gapMs = Date.now() - Date.parse(target.updatedAt);
+          const previous = await this.options.journal.current();
+          if (previous && previous.projection.id !== command.sessionId) {
+            await this.options.onLifecycle?.({ type: "session_end", session: { id: previous.projection.id, reason: "resumed_another" } });
+          }
           const snapshot = await this.options.journal.resume(command.sessionId);
           this.restoreConversation(snapshot);
           this.resumeReminder = gapMs > 24 * 60 * 60 * 1_000
             ? `This Session was resumed after ${Math.floor(gapMs / (60 * 60 * 1_000))} hours. Revalidate time-sensitive assumptions and external state before relying on the earlier history.`
             : undefined;
+          if (!previous || previous.projection.id !== snapshot.projection.id) {
+            await this.options.onLifecycle?.({ type: "session_start", session: { id: snapshot.projection.id, reason: "resumed" } });
+          }
           return { kind: "success", message: `Resumed Session ${snapshot.projection.id}`, clearTimeline: true };
         }
         case "session.delete": {
@@ -191,8 +205,24 @@ export class WorkspaceRuntime {
         }
       }
     } catch (error) {
+      if (!(command.kind === "context.compact" && error instanceof ContextCompactorError)) {
+        await this.options.onLifecycle?.({ type: "system_error", error: {
+          source: command.kind,
+          message: boundedMessage(error),
+          ...(error instanceof Error && "code" in error && typeof error.code === "string" ? { code: error.code } : {}),
+        } });
+      }
       return { kind: "blocked", code: "operation_failed", message: boundedMessage(error) };
     }
+  }
+
+  async close(reason = "system_exit"): Promise<void> {
+    await this.persistenceTail;
+    await this.persistConversationTail();
+    const current = await this.options.journal.current();
+    if (!current) return;
+    await this.options.onLifecycle?.({ type: "session_end", session: { id: current.projection.id, reason } });
+    await this.options.journal.close(reason);
   }
 
   async inspect(query: RuntimeQuery): Promise<RuntimeQueryResult> {

@@ -97,9 +97,15 @@ export interface Config {
   providers: ProviderConfig[];
   mcp_servers: Record<string, McpServerConfig>;
   enable_coordinator_mode: boolean;
+  llm_io_hook?: LlmIoHookConfig;
   tools: ToolsConfig;
   agent: AgentConfig;
   prompt: PromptConfig;
+}
+
+export interface LlmIoHookConfig {
+  readonly enabled: boolean;
+  readonly path?: string;
 }
 
 export interface PromptConfig {
@@ -174,6 +180,7 @@ const ROOT_KEYS = new Set([
   "providers",
   "mcp_servers",
   "enable_coordinator_mode",
+  "llm_io_hook",
   "tools",
   "agent",
   "prompt",
@@ -211,6 +218,14 @@ function validatePartialConfig(raw: unknown, path: string, userGlobal: boolean):
   }
   if (raw.enable_coordinator_mode !== undefined && typeof raw.enable_coordinator_mode !== "boolean") {
     throw new ConfigError(`${path} enable_coordinator_mode 必须是布尔值。`);
+  }
+  if (raw.llm_io_hook !== undefined) {
+    if (!isPlainObject(raw.llm_io_hook)) throw new ConfigError(`${path} llm_io_hook must be an object`);
+    rejectUnknown(raw.llm_io_hook, new Set(["enabled", "path"]), `${path} llm_io_hook`);
+    if (typeof raw.llm_io_hook.enabled !== "boolean") throw new ConfigError(`${path} llm_io_hook.enabled must be a boolean`);
+    if (raw.llm_io_hook.path !== undefined && (typeof raw.llm_io_hook.path !== "string" || raw.llm_io_hook.path.length === 0)) {
+      throw new ConfigError(`${path} llm_io_hook.path must be a non-empty string`);
+    }
   }
   if (raw.agent !== undefined) {
     if (!isPlainObject(raw.agent)) throw new ConfigError(`${path} agent 必须是对象。`);
@@ -381,6 +396,7 @@ function parseConfig(
     providers,
     mcp_servers: parseMcpServers(root?.mcp_servers, mcpSources),
     enable_coordinator_mode: root?.enable_coordinator_mode === true,
+    ...(root?.llm_io_hook === undefined ? {} : { llm_io_hook: root.llm_io_hook }),
     tools: {
       skip_dirs: root?.tools?.skip_dirs ?? ["node_modules", "dist", "build", "coverage"],
       max_parallel_reads: root?.tools?.max_parallel_reads ?? 4,

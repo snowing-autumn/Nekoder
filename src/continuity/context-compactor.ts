@@ -2,7 +2,7 @@ import type { ModelMessage } from "ai";
 
 import type { ConversationManager } from "../conversation/conversation.js";
 import type { ModelInvoker } from "../model/types.js";
-import { TokenCounter, type TokenBudget } from "./token-counter.js";
+import type { TokenBudget, TokenBudgetInput } from "./token-counter.js";
 
 const AUTO_SAFETY_TOKENS = 13_000;
 const MANUAL_SAFETY_TOKENS = 3_000;
@@ -50,12 +50,13 @@ export type CompactionResult =
 export interface ContextCompactorOptions {
   readonly conversation: ConversationManager;
   readonly model: ModelInvoker;
-  readonly counter: TokenCounter;
+  readonly counter: { budget(input: TokenBudgetInput): TokenBudget };
   readonly reservedOutput?: number;
   readonly system?: () => unknown;
   readonly supplemental?: () => unknown;
   readonly tools?: () => unknown;
-  readonly onCompacted?: (result: Extract<CompactionResult, { kind: "compacted" }>) => void | Promise<void>;
+  readonly onCompacted?: (result: Extract<CompactionResult, { kind: "compacted" }>, manual: boolean) => void | Promise<void>;
+  readonly onError?: (error: ContextCompactorError, manual: boolean) => void | Promise<void>;
 }
 
 export class ContextCompactorError extends Error {
@@ -153,12 +154,15 @@ export class ContextCompactor {
       };
       this.failures = 0;
       this.boundaryPending = true;
-      await this.options.onCompacted?.(result);
+      await this.options.onCompacted?.(result, manual);
       return result;
     } catch (cause) {
       this.failures += 1;
-      if (cause instanceof ContextCompactorError) throw cause;
-      throw new ContextCompactorError("summary_failed", boundedMessage(cause), { cause });
+      const error = cause instanceof ContextCompactorError
+        ? cause
+        : new ContextCompactorError("summary_failed", boundedMessage(cause), { cause });
+      await this.options.onError?.(error, manual);
+      throw error;
     }
   }
 

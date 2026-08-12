@@ -121,8 +121,8 @@ function escapeSupplement(content: string): string {
 function taskModeText(mode: "plan" | "execute", full: boolean): string {
   if (mode === "plan") {
     return full
-      ? "Task Mode: Plan. Investigate and produce a structured plan. Do not write files. Commands require user approval and are not proven side-effect free."
-      : "Task Mode: Plan. Do not write files. Commands require user approval.";
+      ? "Task Mode: Plan. Investigate only as needed to formulate the plan. Do not implement or complete the user's task, and do not write files. Commands require user approval and are not proven side-effect free. Your final response must be an actionable plan that states the intended changes and verification; do not present investigation as completed implementation."
+      : "Task Mode: Plan. Do not implement the task or write files. Commands require user approval. Your final response must be an actionable plan.";
   }
   return full
     ? "Task Mode: Execute. Continue until the task is naturally complete. This mode does not authorize any specific tool call."
