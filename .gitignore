@@ -6,9 +6,15 @@ out
 dist
 *.tgz
 
-# code coverage
+# tests and code coverage
+/test/
+/tests/
 coverage
 *.lcov
+
+# internal project documentation (keep the public README)
+*.md
+!README.md
 
 # logs
 logs
@@ -33,7 +39,7 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Finder (MacOS) folder config
 .DS_Store
 
-docs/
+/docs/
 .scratch/
 config.yaml
 .nekoder/
