@@ -1,3 +1,4 @@
+import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline/promises";
@@ -52,28 +53,48 @@ export interface CliOptions {
   readonly plainIcons: boolean;
   readonly reduceMotion: boolean;
   readonly help: boolean;
+  readonly workspace?: string;
 }
 
 export function parseCliOptions(args: readonly string[]): CliOptions {
-  const options = {
+  const options: {
+    demo: boolean;
+    debug: boolean;
+    plainIcons: boolean;
+    reduceMotion: boolean;
+    help: boolean;
+    workspace?: string;
+  } = {
     demo: false,
     debug: false,
     plainIcons: false,
     reduceMotion: false,
     help: false,
   };
-  for (const arg of args) {
+  const setWorkspace = (value: string, flag: string): void => {
+    if (value === "") throw new Error(`Missing value for option: ${flag}`);
+    options.workspace = value;
+  };
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
     if (arg === "--demo") options.demo = true;
     else if (arg === "--debug") options.debug = true;
     else if (arg === "--plain-icons") options.plainIcons = true;
     else if (arg === "--reduce-motion") options.reduceMotion = true;
     else if (arg === "--help" || arg === "-h") options.help = true;
+    else if (arg === "--workspace" || arg === "--cwd" || arg === "-C") {
+      const value = args[index + 1];
+      if (value === undefined) throw new Error(`Missing value for option: ${arg}`);
+      setWorkspace(value, arg);
+      index += 1;
+    } else if (arg.startsWith("--workspace=")) setWorkspace(arg.slice("--workspace=".length), "--workspace");
+    else if (arg.startsWith("--cwd=")) setWorkspace(arg.slice("--cwd=".length), "--cwd");
     else throw new Error(`Unknown option: ${arg}`);
   }
   return options;
 }
 
-const HELP = `Nekoder TUI\n\nUsage: bun run src/index.tsx [options]\n\n  --demo           Run without an API key\n  --debug          Show in-memory UI diagnostics\n  --plain-icons    Do not require Nerd Font glyphs\n  --reduce-motion  Disable non-essential animation\n  -h, --help       Show this help\n`;
+const HELP = `Nekoder TUI\n\nUsage: bun run src/index.tsx [options]\n\n  --workspace <dir>  Set the workspace root (default: current directory)\n  --cwd <dir>, -C    Alias for --workspace\n  --demo             Run without an API key\n  --debug            Show in-memory UI diagnostics\n  --plain-icons      Do not require Nerd Font glyphs\n  --reduce-motion    Disable non-essential animation\n  -h, --help         Show this help\n`;
 
 export async function runCli(
   args: readonly string[] = process.argv.slice(2),
@@ -99,7 +120,13 @@ export async function runCli(
     return 2;
   }
 
-  const workspace = process.cwd();
+  let workspace: string;
+  try {
+    workspace = resolveWorkspace(options.workspace);
+  } catch (error) {
+    io.stderr.write(`${sanitizeTerminalText(String(error))}\n`);
+    return 2;
+  }
   let configured: {
     readonly controller: SessionController;
     readonly model?: string;
@@ -635,6 +662,22 @@ async function createConfiguredApplication(
       await mcpManager.close();
     },
   };
+}
+
+function resolveWorkspace(requested: string | undefined): string {
+  if (requested === undefined) return process.cwd();
+  const absolute = resolve(process.cwd(), requested);
+  let stats: import("node:fs").Stats;
+  try {
+    stats = statSync(absolute);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new Error(`Workspace directory does not exist: ${absolute}`);
+    }
+    throw new Error(`Unable to access workspace directory ${absolute}: ${String(error)}`);
+  }
+  if (!stats.isDirectory()) throw new Error(`Workspace path is not a directory: ${absolute}`);
+  return absolute;
 }
 
 function narrowPermissionMode(
